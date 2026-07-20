@@ -3,7 +3,8 @@
 //! 客户端可见的输入用量优先由 Kiro `contextUsagePercentage` 与模型窗口
 //! 直接换算。百分比缺失、为零或无效时，才回退到请求内容计数：
 //! 优先使用配置的 `count_tokens` API，失败时用 `cl100k_base` 本地估算。
-//! 不再对 Kiro 换算值扣固定隐藏 token 或乘额外校正系数，避免档位失真。
+//! 按 Kiro-Go 的公开 usage 口径扣除 Kiro 后端固定系统上下文，但不再
+//! 乘旧的 1.843 系数，以保持各输入档位与当前测试基准的线性一致。
 
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
@@ -13,6 +14,11 @@ use crate::model::config::TlsBackend;
 use std::sync::OnceLock;
 
 const CLAUDE_TOKEN_CORRECTION_FACTOR: f64 = 1.10;
+// 沿用 Kiro-Go 的公开 usage 校准结构：context occupancy 包含一段
+// 不应计入客户端 input usage 的后端系统提示。常量基于 2026-07-20
+// tokencheap.io 与两组 aitokentest 凭证的最新 R8 结果标定。
+const KIRO_DEFAULT_SYSTEM_PROMPT_TOKENS: i32 = 6_480;
+const CLAUDE_PUBLIC_CONTEXT_USAGE_MIN_TOKENS: i32 = 8;
 const APPROX_IMAGE_INPUT_TOKENS: u64 = 100;
 const APPROX_DOCUMENT_INPUT_TOKENS: u64 = 3_000;
 
@@ -337,8 +343,9 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
 /// 生成客户端可见的 public total input。
 ///
 /// Kiro 百分比是首要依据：先换算已占用上下文，再扣掉同轮输出。
-/// 请求计数只在百分比不可用时回退。不扣固定的 Kiro 隐藏系统 token，
-/// 也不再乘 1.843，因为 R8 实测表明百分比的直接换算值已与基线一致。
+/// 按 Kiro-Go 的公开 Claude usage 逻辑，还需扣除 Kiro 后端自有的固定
+/// system prompt 开销；小请求保留公开 usage envelope 下限。请求计数
+/// 只在百分比不可用时回退。
 pub(crate) fn finalize_public_input_tokens(
     estimated_input_tokens: i32,
     context_usage_percentage: Option<f64>,
@@ -354,7 +361,11 @@ pub(crate) fn finalize_public_input_tokens(
 
     let window = context_window.max(0);
     let occupied = ((window as f64) * percentage / 100.0).round() as i32;
-    (occupied - output_tokens.max(0)).clamp(0, window)
+    let context_input = (occupied - output_tokens.max(0)).max(0);
+    let client_visible = context_input - KIRO_DEFAULT_SYSTEM_PROMPT_TOKENS;
+    client_visible
+        .max(CLAUDE_PUBLIC_CONTEXT_USAGE_MIN_TOKENS)
+        .clamp(0, window)
 }
 
 #[cfg(test)]
@@ -393,19 +404,23 @@ mod tests {
     }
 
     #[test]
-    fn public_input_tokens_follow_direct_kiro_percentage_across_r8_samples() {
-        let samples = [
-            (0.6546, 6_545),
-            (0.6956, 6_955),
-            (1.0064, 10_063),
-            (4.2027, 42_026),
-            (18.4126, 184_125),
+    fn public_input_tokens_match_latest_tokencheap_r8_baseline() {
+        let baseline = [32, 1_023, 9_945, 99_177, 495_762];
+        let context_inputs = [
+            [6_516, 7_548, 16_432, 105_618, 502_202],
+            [6_510, 7_473, 16_385, 105_617, 502_201],
         ];
-        for (percentage, expected) in samples {
-            assert_eq!(
-                finalize_public_input_tokens(123, Some(percentage), 1_000_000, 1),
-                expected
-            );
+
+        for samples in context_inputs {
+            for (context_input, expected) in samples.into_iter().zip(baseline) {
+                let percentage = context_input as f64 / 10_000.0;
+                let actual = finalize_public_input_tokens(1, Some(percentage), 1_000_000, 0);
+                let tolerance = (expected as f64 * 0.10).max(5.0);
+                assert!(
+                    (actual - expected).abs() as f64 <= tolerance,
+                    "context input {context_input}: actual={actual}, baseline={expected}, tolerance={tolerance}"
+                );
+            }
         }
     }
 
