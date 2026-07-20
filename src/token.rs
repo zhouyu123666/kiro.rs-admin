@@ -17,7 +17,7 @@ const CLAUDE_TOKEN_CORRECTION_FACTOR: f64 = 1.10;
 // 沿用 Kiro-Go 的公开 usage 校准结构：context occupancy 包含一段
 // 不应计入客户端 input usage 的后端系统提示。常量基于 2026-07-20
 // tokencheap.io 与两组 aitokentest 凭证的最新 R8 结果标定。
-const KIRO_DEFAULT_SYSTEM_PROMPT_TOKENS: i32 = 6_480;
+const KIRO_DEFAULT_SYSTEM_PROMPT_TOKENS: i32 = 6_504;
 const CLAUDE_PUBLIC_CONTEXT_USAGE_MIN_TOKENS: i32 = 8;
 const APPROX_IMAGE_INPUT_TOKENS: u64 = 100;
 const APPROX_DOCUMENT_INPUT_TOKENS: u64 = 3_000;
