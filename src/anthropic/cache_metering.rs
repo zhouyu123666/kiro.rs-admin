@@ -4,16 +4,13 @@
 //! 只给 credit 计费量），所以这里在中转层自行模拟"提示词缓存"，复现 Anthropic
 //! 滑动窗口缓存的「最长公共前缀命中」语义：
 //!
-//! - 把 prompt 的稳定前缀按 message 边界切成一条递增前缀段链：
-//!   `[tools+system] → [+msg0] → [+msg1] → ... → [+msg(n-2)]`，每段 hash 是
-//!   「从头累积到该边界」的指纹，token 是该前缀的累计估算。
-//! - 最后一条 message（当前轮新输入）不切段——它是本轮 cache_creation 的尾部。
+//! - 断点来自显式 `cache_control`，以及首个显式断点之后的 message-end。
+//! - 请求的最后一个 block 永远不作为本轮断点，仅为下轮预热 TTL。
 //! - lookup 取最深命中段 = 最长已缓存前缀 = `cache_read_input_tokens`；其后到
 //!   末段 = `cache_creation_input_tokens`；完全 miss → cache_read = 0。
 //!
-//! 跨轮命中的关键：历史消息逐字节不变，故 Turn N+1 的历史前缀段 hash 必然等于
-//! Turn N 写入的同一段。会话隔离：哈希链以一个隔离种子起头（优先 metadata
-//! session，否则客户端 Key id），使不同会话 / Key 的相同前缀互不命中。
+//! namespace 只按实际命中的上游凭据 ID 划分；请求成功完成后才写入 cache，
+//! 命中不续 TTL。Sonnet/其他 Claude 最小前缀 1024 token，Opus 为 4096。
 //!
 //! 内存 + JSON 落盘：每分钟一次写到 `cache_dir/cache_metering.json`，启动时读
 //! 回过期记录会被丢掉。**不依赖 Redis 或任何外部 KV**。
@@ -55,7 +52,7 @@ pub struct SegmentResult {
 /// `compute_cache_usage` 的结果：缓存计费量 + 比例分摊所需的 estimate 口径基准。
 ///
 /// `cache_creation` / `cache_read` 是按 `estimate_tokens` 口径算出的「被缓存覆盖
-/// 前缀」的拆分；但最终上报要换算到**真实 total 口径**（contextUsage 真值或
+/// 前缀」的拆分；但最终上报要换算到**public total 口径**（contextUsage 校正值或
 /// `count_tokens` 估算），两个估算器尺度不同，所以这里额外带出两个 estimate 口径
 /// 的基准量，供调用方做**无量纲比例分摊**：
 ///   - `cache_covered_est` = 被缓存覆盖前缀的 estimate token（= creation + read）
@@ -63,7 +60,7 @@ pub struct SegmentResult {
 ///
 /// 调用方据此算 `prefix_ratio = cache_covered_est / prompt_total_est`，再乘到真实
 /// total 上得到缓存覆盖部分，剩余即未缓存的 `input_tokens`，三者互斥相加 == total。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CacheUsage {
     /// 缓存读取 token（estimate 口径，最深命中段累计）。
     /// creation 部分 = `cache_covered_est − cache_read`，无需单独存储。
@@ -72,20 +69,58 @@ pub struct CacheUsage {
     pub cache_covered_est: i32,
     /// 整个 prompt 的 estimate token 总量（比例分摊的分母）。
     pub prompt_total_est: i32,
+    cache_creation_5m: i32,
+    cache_creation_1h: i32,
+    /// 只有请求成功完成后才提交的 cache breakpoint。
+    pending: Vec<PendingCacheEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResolvedCacheUsage {
+    pub input: i32,
+    pub creation: i32,
+    pub read: i32,
+    pub creation_5m: i32,
+    pub creation_1h: i32,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCacheEntry {
+    hash: u64,
+    tokens: u32,
+    ttl_secs: i64,
 }
 
 impl CacheUsage {
+    /// 将 cache profile 分母对齐到请求侧统一 token 估算。Kiro-Go 同样保证
+    /// profile total 不小于累计 breakpoint token。
+    pub fn align_prompt_total_estimate(&mut self, request_total: i32) {
+        self.prompt_total_est = self
+            .prompt_total_est
+            .max(self.cache_covered_est)
+            .max(request_total.max(0));
+    }
+
     /// 按真实 total 口径做互斥分摊，返回 `(input_tokens, cache_creation, cache_read)`。
     ///
-    /// `total_real` 是最终上报口径的全量 prompt token（contextUsage 真值优先，
+    /// `total_real` 是最终上报口径的全量 prompt token（contextUsage 校正值优先，
     /// 否则 `count_tokens` 估算）。三者满足 `input + creation + read == total_real`。
     ///
     /// 无缓存覆盖（`cache_covered_est == 0`）或基准缺失时，直接返回
     /// `(total_real, 0, 0)`——全部计入 input，不凭空造缓存计数。
+    #[cfg(test)]
     pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
+        let resolved = self.resolve_against_total(total_real);
+        (resolved.input, resolved.creation, resolved.read)
+    }
+
+    pub fn resolve_against_total(&self, total_real: i32) -> ResolvedCacheUsage {
         let total = total_real.max(0);
         if self.cache_covered_est <= 0 || self.prompt_total_est <= 0 {
-            return (total, 0, 0);
+            return ResolvedCacheUsage {
+                input: total,
+                ..Default::default()
+            };
         }
         // 比例无量纲，跨估算器成立；clamp 到 [0, total] 防止 estimate 偏差越界。
         let ratio = (self.cache_covered_est as f64 / self.prompt_total_est as f64).clamp(0.0, 1.0);
@@ -100,9 +135,45 @@ impl CacheUsage {
         };
         let read = read.clamp(0, cache_total);
         let creation = cache_total - read;
-        let input = total - cache_total;
-        (input, creation, read)
+        let mut input = total - cache_total;
+        let mut creation = creation;
+        let mut read = read;
+
+        // Kiro-Go envelope floor：完全命中时仍保留少量未缓存输入，
+        // 避免对外上报 input_tokens=0。
+        if cache_total > 0 && input < 6 {
+            input = total.min(6);
+            let budget = total - input;
+            read = proportional_int(budget, read, cache_total);
+            creation = budget - read;
+        }
+        let raw_creation = self.cache_creation_5m + self.cache_creation_1h;
+        let creation_5m = if raw_creation > 0 {
+            proportional_int(creation, self.cache_creation_5m, raw_creation)
+        } else {
+            creation
+        };
+        ResolvedCacheUsage {
+            input,
+            creation,
+            read,
+            creation_5m,
+            creation_1h: creation - creation_5m,
+        }
     }
+
+    /// 请求成功后写入 cache；失败/中断请求不得预热缓存。
+    pub fn commit(&self, cache: &CacheMeter) {
+        cache.record_pending(&self.pending);
+    }
+}
+
+fn proportional_int(total: i32, numerator: i32, denominator: i32) -> i32 {
+    if total <= 0 || numerator <= 0 || denominator <= 0 {
+        return 0;
+    }
+    let value = ((total as i64 * numerator as i64) + denominator as i64 / 2) / denominator as i64;
+    value.min(total as i64) as i32
 }
 
 /// 进程内提示词缓存
@@ -168,6 +239,7 @@ impl CacheMeter {
     }
 
     /// 把一组前缀段写入缓存（用于 miss 后登记 / 续期）。`ttl_secs` clip 到 [60, MAX_TTL_SECS]。
+    #[cfg(test)]
     pub fn record(&self, segment_hashes: &[u64], segment_tokens: &[u32], ttl_secs: i64) {
         debug_assert_eq!(segment_hashes.len(), segment_tokens.len());
         let ttl = ttl_secs.clamp(60, MAX_TTL_SECS);
@@ -186,6 +258,38 @@ impl CacheMeter {
         }
         inner.dirty = true;
         // 容量超限：按 last_hit_at 淘汰最旧的若干条
+        if inner.entries.len() > DEFAULT_CAPACITY {
+            let drop_n = inner.entries.len() - DEFAULT_CAPACITY;
+            let mut victims: Vec<(u64, i64)> = inner
+                .entries
+                .iter()
+                .map(|(k, v)| (*k, v.last_hit_at))
+                .collect();
+            victims.sort_by_key(|x| x.1);
+            for (k, _) in victims.into_iter().take(drop_n) {
+                inner.entries.remove(&k);
+            }
+        }
+    }
+
+    fn record_pending(&self, pending: &[PendingCacheEntry]) {
+        if pending.is_empty() {
+            return;
+        }
+        let now = now_secs();
+        let mut inner = self.inner.lock();
+        for item in pending {
+            let ttl = item.ttl_secs.clamp(60, MAX_TTL_SECS);
+            inner.entries.insert(
+                item.hash,
+                CacheEntry {
+                    tokens: item.tokens,
+                    expires_at: now + ttl,
+                    last_hit_at: now,
+                },
+            );
+        }
+        inner.dirty = true;
         if inner.entries.len() > DEFAULT_CAPACITY {
             let drop_n = inner.entries.len() - DEFAULT_CAPACITY;
             let mut victims: Vec<(u64, i64)> = inner
@@ -300,8 +404,8 @@ struct Segment {
     ttl_secs: i64,
 }
 
-/// 调用 CacheMeter 计算本次请求的缓存覆盖情况，并把所有断点（含命中段）记录回
-/// cache、刷新 TTL。返回 [`CacheUsage`]，由调用方在拿到真实 total 后做互斥分摊。
+/// 计算本次请求的缓存覆盖情况。返回值携带待提交断点，调用方只能在
+/// 请求成功完成后调用 [`CacheUsage::commit`]。
 ///
 /// **完全按 Anthropic 协议**：取最深命中的段索引 i*，那么（estimate 口径）
 /// - `cache_read = segments[i*].cumulative_tokens`
@@ -316,11 +420,22 @@ struct Segment {
 /// 没有任何 cache_control 断点时，返回全零的 `CacheUsage`（`split_against_total`
 /// 会把 total 全部计入 input）且不写入。
 ///
-/// `key_id` 是客户端 Key id，用于会话隔离：前缀哈希会混入一个隔离种子（优先取
-/// 请求 metadata 里的 session，否则退回 key_id），使不同会话 / 不同客户端 Key 的
-/// 缓存互不命中——同一前缀只在同一会话内复用。
-pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u64) -> CacheUsage {
-    let (segments, prompt_total_est) = extract_segments(req, key_id);
+/// `credential_id` 是实际命中的上游账号 namespace；0 表示尚未命中上游，不计 cache。
+pub fn compute_cache_usage(
+    cache: &CacheMeter,
+    req: &MessagesRequest,
+    credential_id: u64,
+) -> CacheUsage {
+    compute_cache_usage_with_min(cache, req, credential_id, min_cacheable_tokens(&req.model))
+}
+
+fn compute_cache_usage_with_min(
+    cache: &CacheMeter,
+    req: &MessagesRequest,
+    credential_id: u64,
+    min_tokens: u32,
+) -> CacheUsage {
+    let (segments, prompt_total_est) = extract_segments(req, credential_id);
     if segments.is_empty() {
         // 无断点：仍带出 prompt_total_est 以便调用方将来扩展，但 covered=0 → 全入 input。
         return CacheUsage {
@@ -354,23 +469,69 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
         );
     }
 
-    let deepest_hit = results.iter().rposition(|r| r.hit);
+    let deepest_hit = results
+        .iter()
+        .enumerate()
+        .rposition(|(i, r)| r.hit && cum_tokens[i] >= min_tokens);
     // 被缓存覆盖的前缀 = 最深断点累计（最深断点之后的尾部是未缓存的真 input）。
     // 命中时 read = 命中段累计、creation = covered − read；全 miss 时 read = 0。
     let covered = *cum_tokens.last().unwrap();
+    if covered < min_tokens {
+        return CacheUsage {
+            prompt_total_est: prompt_total_est as i32,
+            ..Default::default()
+        };
+    }
     let cache_read = match deepest_hit {
         Some(i) => cum_tokens[i],
         None => 0u32,
     };
-
-    // 把所有段一次性写回（命中段刷新 last_hit_at；未命中段插入）。所有段共用同一
-    // ttl（detect_max_ttl 的单值），单次加锁 + 单次容量检查，避免逐段重复开销。
-    cache.record(&hashes, &cum_tokens, segments[0].ttl_secs);
+    let (cache_creation_5m, cache_creation_1h) =
+        cache_creation_ttl_breakdown(&segments, cache_read);
 
     CacheUsage {
         cache_read: cache_read as i32,
         cache_covered_est: covered as i32,
         prompt_total_est: prompt_total_est as i32,
+        cache_creation_5m: cache_creation_5m as i32,
+        cache_creation_1h: cache_creation_1h as i32,
+        pending: segments
+            .iter()
+            .zip(results.iter())
+            .filter(|(s, result)| s.cumulative_tokens >= min_tokens && !result.hit)
+            .map(|(s, _)| PendingCacheEntry {
+                hash: s.hash,
+                tokens: s.cumulative_tokens,
+                ttl_secs: s.ttl_secs,
+            })
+            .collect(),
+    }
+}
+
+fn cache_creation_ttl_breakdown(segments: &[Segment], matched_tokens: u32) -> (u32, u32) {
+    let mut cache_5m = 0u32;
+    let mut cache_1h = 0u32;
+    let mut previous = matched_tokens;
+    for segment in segments {
+        if segment.cumulative_tokens <= previous {
+            continue;
+        }
+        let delta = segment.cumulative_tokens - previous;
+        if segment.ttl_secs >= 3600 {
+            cache_1h = cache_1h.saturating_add(delta);
+        } else {
+            cache_5m = cache_5m.saturating_add(delta);
+        }
+        previous = segment.cumulative_tokens;
+    }
+    (cache_5m, cache_1h)
+}
+
+fn min_cacheable_tokens(model: &str) -> u32 {
+    if model.to_ascii_lowercase().contains("opus") {
+        4096
+    } else {
+        1024
     }
 }
 
@@ -383,9 +544,8 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
 /// 返回 `(segments, prompt_total_est)`，其中 `prompt_total_est` 是喂完整个 prompt
 /// （含最深断点之后的尾部）后的 estimate token 累计，用作比例分摊的分母。
 ///
-/// `key_id` 用于会话隔离：哈希以一个隔离种子起头（优先用 metadata session，否则
-/// key_id），种子不计入 token，只让不同会话的同前缀产生不同 hash → 互不命中。
-fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
+/// 指纹以上游 `credential_id` 开头，只在同一账号内复用。
+fn extract_segments(req: &MessagesRequest, credential_id: u64) -> (Vec<Segment>, u32) {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     let mut cum_tokens: u32 = 0;
@@ -393,14 +553,21 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
     // 被跳过的动态 system 头部 token：只计入 prompt_total 分母，不进哈希 / 缓存段。
     let mut dynamic_prefix_tokens: u32 = 0;
 
-    // 会话隔离种子：作为哈希链最前置的输入，不进 token 估算。同一会话内前缀稳定
-    // 复用；跨会话 / 跨客户端 Key 的相同前缀因种子不同而 hash 不同，互不命中。
-    // 为 None（主 Key 无 session，被多用户共享）时不模拟缓存，直接返回空段：
-    // compute_cache_usage 对空段走「全 input、零缓存、不回写」的分支。
-    let Some(seed) = isolation_seed(req, key_id) else {
+    // Kiro-Go 的 cache namespace 只按实际上游账号划分。
+    if credential_id == 0 {
         return (Vec::new(), 0);
-    };
-    hasher.update(seed.as_bytes());
+    }
+    hasher.update(format!("account:{credential_id}").as_bytes());
+
+    // request prelude 参与指纹和 cache estimate。
+    let prelude = serde_json::json!({
+        "kind": "request_prelude",
+        "model": req.model,
+        "tool_choice": req.tool_choice,
+    });
+    let prelude_text = canonical_json(&prelude);
+    hasher.update(prelude_text.as_bytes());
+    cum_tokens = cum_tokens.saturating_add(estimate_tokens(&prelude_text).max(0) as u32);
 
     // feed 解耦哈希与 token 估算：`hash_text` 进哈希链（决定命中），`token_text`
     // 进 token 累计（决定数值口径）。两者分离是为了让 token 计数贴近**原文**，
@@ -441,8 +608,7 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
     // tool_result 也是 role=user，锚点每轮指向不同物理消息，前缀永不对齐，
     // 导致 cache_read 恒为 0、全部记成 creation。
 
-    // 统一 ttl：探测整个请求里出现过的最大 cache_control.ttl，否则默认 5m。
-    let ttl = detect_max_ttl(req);
+    let mut active_ttl: Option<i64> = None;
 
     // 1. tools（全部喂入，作为前缀基础的一部分；工具定义跨轮稳定）。
     if let Some(tools) = req.tools.as_ref() {
@@ -453,6 +619,10 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
                 &tool_token_text(t),
                 &mut cum_tokens,
             );
+            if let Some(ttl) = explicit_ttl(t.cache_control.as_ref()) {
+                active_ttl = Some(ttl);
+                commit(&hasher, cum_tokens, &mut segments, ttl);
+            }
         }
     }
 
@@ -479,21 +649,23 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
                 dynamic_prefix_tokens.saturating_add(estimate_tokens(&sys.text).max(0) as u32);
         }
         for sys in systems.iter().skip(skip_until) {
+            if is_anthropic_billing_header(&sys.text) {
+                continue;
+            }
             feed(
                 &mut hasher,
                 &system_signature(sys),
                 &sys.text,
                 &mut cum_tokens,
             );
+            if let Some(ttl) = explicit_ttl(sys.cache_control.as_ref()) {
+                active_ttl = Some(ttl);
+                commit(&hasher, cum_tokens, &mut segments, ttl);
+            }
         }
     }
 
-    // tools+system 前缀作为链的第一个段（仅当确实有内容时）。
-    if cum_tokens > 0 {
-        commit(&hasher, cum_tokens, &mut segments, ttl);
-    }
-
-    // 3. messages：除最后一条外，每条 message 边界切一个递增前缀段。
+    // 3. messages：显式 block 断点 + 首个显式断点之后的 message-end 隐式断点。
     let last_idx = req.messages.len().saturating_sub(1);
     for (idx, msg) in req.messages.iter().enumerate() {
         // role 进哈希（区分 user/assistant 边界），但不计入 token。
@@ -501,13 +673,19 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
         match &msg.content {
             serde_json::Value::String(s) => {
                 feed(&mut hasher, s, s, &mut cum_tokens);
+                if idx != last_idx
+                    && let Some(ttl) = active_ttl
+                {
+                    commit(&hasher, cum_tokens, &mut segments, ttl);
+                }
             }
             serde_json::Value::Array(arr) => {
                 // 逐 block 处理：文本块哈希用结构化签名、token 算原文；图片块哈希纳入
                 // 图片数据指纹（区分不同图）、token 用 Anthropic 口径估算（(w×h)/750）。
                 // 不反序列化整个 block、不 clone Value：省开销，且避免「某 block
                 // 反序列化失败被跳过」造成的前缀漂移。
-                for v in arr {
+                let last_block_idx = arr.len().saturating_sub(1);
+                for (block_idx, v) in arr.iter().enumerate() {
                     if v.get("type").and_then(|t| t.as_str()) == Some("image") {
                         // 图片：哈希喂 media_type + 数据（保证不同图 hash 不同、同图稳定），
                         // token 按真实尺寸估算后直接累加（base64 不进文本 estimate）。
@@ -527,13 +705,24 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
                             &mut cum_tokens,
                         );
                     }
+
+                    let block_ttl = value_explicit_ttl(v);
+                    if let Some(ttl) = block_ttl {
+                        active_ttl = Some(ttl);
+                    }
+                    let is_message_end = block_idx == last_block_idx;
+                    let is_request_tail = idx == last_idx && is_message_end;
+                    if is_request_tail {
+                        continue;
+                    }
+                    if let Some(ttl) =
+                        block_ttl.or_else(|| is_message_end.then_some(active_ttl).flatten())
+                    {
+                        commit(&hasher, cum_tokens, &mut segments, ttl);
+                    }
                 }
             }
             _ => {}
-        }
-        // 最后一条不切段（当前轮新输入，属 cache_creation 尾部）。
-        if idx != last_idx {
-            commit(&hasher, cum_tokens, &mut segments, ttl);
         }
     }
 
@@ -542,76 +731,51 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
     (segments, cum_tokens.saturating_add(dynamic_prefix_tokens))
 }
 
-/// 生成会话隔离种子，作为前缀哈希链的最前置输入。
-///
-/// 优先级：
-///   1. metadata.user_id 里的 session 段（Claude Code 格式含 `_session_<uuid>`）
-///      —— 最精确的会话维度，同一会话多轮共享、跨会话隔离。
-///   2. 主 apiKey（系统 Key，`key_id==0`）且无 session → `None`：该 Key 被多个
-///      用户共享，若按 key 模拟缓存会产生跨用户虚假命中，故不模拟缓存。
-///   3. 其余客户端 Key（`key_id!=0`）→ 按 key 隔离，保留合法的按 Key 缓存复用。
-///
-/// 种子只参与哈希、不计入 token 估算，因此不影响 cache_creation/read 的数值口径。
-/// 返回 `None` 表示本次请求不应模拟缓存（调用方据此产出全 input、零缓存）。
-fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
-    if let Some(session) = req
-        .metadata
-        .as_ref()
-        .and_then(|m| m.user_id.as_deref())
-        .and_then(extract_session_id)
-    {
-        return Some(format!("sess:{session}"));
-    }
-    if key_id == 0 {
+fn explicit_ttl(cache_control: Option<&CacheControl>) -> Option<i64> {
+    let cc = cache_control?;
+    if !cc.cache_type.eq_ignore_ascii_case("ephemeral") {
         return None;
     }
-    Some(format!("key:{key_id}"))
+    Some(parse_ttl(cc.ttl.as_deref()))
 }
 
-/// 从 Claude Code 的 user_id 中提取 session 标识。
-///
-/// 格式形如 `user_<hash>_account__session_<uuid>`，取 `_session_` 之后的部分。
-/// 不含该标记时返回 None（交由调用方退回 key_id）。
-fn extract_session_id(user_id: &str) -> Option<String> {
-    user_id
-        .split_once("_session_")
-        .map(|(_, sid)| sid.trim().to_string())
-        .filter(|s| !s.is_empty())
+fn value_explicit_ttl(block: &serde_json::Value) -> Option<i64> {
+    let cache_type = block
+        .get("cache_control")
+        .and_then(|cc| cc.get("type"))
+        .and_then(|value| value.as_str());
+    if !cache_type.is_some_and(|value| value.eq_ignore_ascii_case("ephemeral")) {
+        return None;
+    }
+    let ttl = block
+        .get("cache_control")
+        .and_then(|cc| cc.get("ttl"))
+        .and_then(|value| value.as_str());
+    Some(parse_ttl(ttl))
 }
 
-/// 探测请求里出现过的最大 cache_control.ttl（"1h" 优先于 "5m"）；
-/// 无任何 cache_control 时返回默认 5m。决定写入缓存段的存活时长。
-fn detect_max_ttl(req: &MessagesRequest) -> i64 {
-    let mut ttl = DEFAULT_TTL_SECS;
-    let mut bump = |cc: Option<&CacheControl>| {
-        if let Some(cc) = cc {
-            ttl = ttl.max(parse_ttl(cc.ttl.as_deref()));
-        }
-    };
-    if let Some(tools) = req.tools.as_ref() {
-        for t in tools {
-            bump(t.cache_control.as_ref());
-        }
-    }
-    if let Some(systems) = req.system.as_ref() {
-        for sys in systems {
-            bump(sys.cache_control.as_ref());
-        }
-    }
-    for msg in &req.messages {
-        if let serde_json::Value::Array(arr) = &msg.content {
-            for v in arr {
-                if let Some(t) = v
-                    .get("cache_control")
-                    .and_then(|cc| cc.get("ttl"))
-                    .and_then(|t| t.as_str())
-                {
-                    ttl = ttl.max(parse_ttl(Some(t)));
-                }
+fn canonical_json(value: &serde_json::Value) -> String {
+    fn normalize(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(normalize).collect())
             }
+            serde_json::Value::Object(map) => {
+                let mut ordered = serde_json::Map::new();
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort_unstable();
+                for key in keys {
+                    if key == "cache_control" {
+                        continue;
+                    }
+                    ordered.insert(key.clone(), normalize(&map[key]));
+                }
+                serde_json::Value::Object(ordered)
+            }
+            other => other.clone(),
         }
     }
-    ttl
+    serde_json::to_string(&normalize(value)).unwrap_or_default()
 }
 
 fn tool_signature(t: &Tool) -> String {
@@ -631,27 +795,23 @@ fn system_signature(s: &SystemMessage) -> String {
     format!("sys:{}", s.text)
 }
 
+fn is_anthropic_billing_header(text: &str) -> bool {
+    text.trim_start()
+        .to_ascii_lowercase()
+        .starts_with("x-anthropic-billing-header:")
+}
+
 /// 直接从 content block 的 JSON 值算签名，只取 type/text/thinking 三个字段。
 ///
 /// 不反序列化整个 ContentBlock、不 clone：image 的 base64、tool_use 的 input、
 /// tool_result 的 content 等大字段或易变字段都不参与签名，保证前缀指纹稳定且廉价。
 fn block_signature_value(v: &serde_json::Value) -> String {
-    let s = |key: &str| v.get(key).and_then(|x| x.as_str()).unwrap_or("");
-    format!("block:{}|{}|{}", s("type"), s("text"), s("thinking"))
+    canonical_json(v)
 }
 
-/// content block 的 token 估算原文：仅 text + thinking 的纯文本，不含签名结构标记。
+/// content block 的 cache-profile 估算文本：去掉 cache_control 后的稳定 JSON。
 fn block_token_text(v: &serde_json::Value) -> String {
-    let s = |key: &str| v.get(key).and_then(|x| x.as_str()).unwrap_or("");
-    let text = s("text");
-    let thinking = s("thinking");
-    if thinking.is_empty() {
-        text.to_string()
-    } else if text.is_empty() {
-        thinking.to_string()
-    } else {
-        format!("{text} {thinking}")
-    }
+    canonical_json(v)
 }
 
 /// 从 image content block 的 JSON 值取 `(media_type, base64_data)`。
@@ -674,6 +834,17 @@ fn image_source_parts(v: &serde_json::Value) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 模拟一次完整成功的请求：先计算本轮 usage，成功后再提交 cache。
+    fn compute_cache_usage(
+        cache: &CacheMeter,
+        req: &MessagesRequest,
+        credential_id: u64,
+    ) -> CacheUsage {
+        let usage = super::compute_cache_usage_with_min(cache, req, credential_id, 1);
+        usage.commit(cache);
+        usage
+    }
 
     #[test]
     fn lookup_miss_then_record_then_hit() {
@@ -799,6 +970,7 @@ mod tests {
             cache_read: 30,
             cache_covered_est: 80, // creation 部分 = 50
             prompt_total_est: 100,
+            ..Default::default()
         };
         // covered 占 prompt 的 80% → 真实 total=1000 时缓存覆盖 800。
         let (input, creation, read) = u.split_against_total(1000);
@@ -815,8 +987,64 @@ mod tests {
             cache_read: 0,
             cache_covered_est: 0,
             prompt_total_est: 100,
+            ..Default::default()
         };
         assert_eq!(u.split_against_total(500), (500, 0, 0));
+    }
+
+    #[test]
+    fn envelope_floor_keeps_six_visible_tokens() {
+        let usage = CacheUsage {
+            cache_read: 100,
+            cache_covered_est: 100,
+            prompt_total_est: 100,
+            ..Default::default()
+        };
+        assert_eq!(usage.split_against_total(100), (6, 0, 94));
+    }
+
+    #[test]
+    fn cache_creation_ttl_breakdown_survives_public_scaling() {
+        let usage = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+            cache_creation_5m: 30,
+            cache_creation_1h: 50,
+            ..Default::default()
+        };
+        let resolved = usage.resolve_against_total(1_000);
+        assert_eq!(resolved.input, 200);
+        assert_eq!(resolved.creation, 800);
+        assert_eq!(resolved.creation_5m, 300);
+        assert_eq!(resolved.creation_1h, 500);
+    }
+
+    #[test]
+    fn production_threshold_and_success_commit_match_kiro_go() {
+        let cache = CacheMeter::new(None);
+        let mut req = build_request_with_system_breakpoint();
+        req.system.as_mut().unwrap()[0].text = "stable prompt ".repeat(2_000);
+
+        // Compute 本身不写 cache：失败请求不得预热。
+        let first = super::compute_cache_usage(&cache, &req, 9);
+        assert!(first.cache_covered_est >= 1024);
+        let before_commit = super::compute_cache_usage(&cache, &req, 9);
+        assert_eq!(before_commit.cache_read, 0);
+
+        first.commit(&cache);
+        let after_commit = super::compute_cache_usage(&cache, &req, 9);
+        assert!(after_commit.cache_read >= 1024);
+
+        // Opus 需 4096；同一份较短 profile 在 Sonnet 可缓存、Opus 不可缓存。
+        req.system.as_mut().unwrap()[0].text = "stable prompt ".repeat(600);
+        req.model = "claude-sonnet-4.6".to_string();
+        assert!(super::compute_cache_usage(&cache, &req, 10).cache_covered_est > 0);
+        req.model = "claude-opus-4.8".to_string();
+        assert_eq!(
+            super::compute_cache_usage(&cache, &req, 11).cache_covered_est,
+            0
+        );
     }
 
     #[test]
@@ -985,7 +1213,7 @@ mod tests {
                 ]),
             }
         };
-        let user_text = |t: &str| msg_with_cc("user", t, false);
+        let user_text = |t: &str| msg_with_cc("user", t, true);
 
         let cache = CacheMeter::new(None);
         // Turn 1: user → assistant(tool_use #a) → user(tool_result #a) → assistant(text) → user(新问题)
@@ -1031,7 +1259,7 @@ mod tests {
         // 第 3 轮：u,a,u,a,u（5 条）。切段：除最后一条外，每条 message 一个前缀段
         // → idx 0,1,2,3 共 4 个段（无 system/tools）。
         let turn3 = req_with_messages(vec![
-            msg_with_cc("user", &body, false),
+            msg_with_cc("user", &body, true),
             msg_with_cc("assistant", &body, false),
             msg_with_cc("user", &body, false),
             msg_with_cc("assistant", &body, false),
@@ -1045,7 +1273,7 @@ mod tests {
         // turn3 的最深段在 idx3（其前缀=u,a,u,a），turn4 的 idx3 段前缀逐字节相同
         // → 命中。turn4 还新增 idx4,5 两个更深的历史前缀段。
         let turn4 = req_with_messages(vec![
-            msg_with_cc("user", &body, false),
+            msg_with_cc("user", &body, true),
             msg_with_cc("assistant", &body, false),
             msg_with_cc("user", &body, false),
             msg_with_cc("assistant", &body, false),
@@ -1069,8 +1297,7 @@ mod tests {
 
     #[test]
     fn prefix_chain_works_without_any_cache_control() {
-        // 新模型不依赖 cache_control：只要有跨轮稳定的历史前缀就能命中。
-        // 这复现 Anthropic 自动前缀缓存语义，与旧"必须有 cache_control"策略不同。
+        // Kiro-Go 口径：没有任何显式 cache_control 时不生成 breakpoint。
         let cache = CacheMeter::new(None);
         let body = "lorem ipsum dolor sit amet ".repeat(20);
         let turn1 = req_with_messages(vec![
@@ -1079,7 +1306,7 @@ mod tests {
             msg_with_cc("user", &body, false),
         ]);
         let u1 = compute_cache_usage(&cache, &turn1, 1);
-        assert!(u1.cache_covered_est > 0, "应为历史前缀创建缓存段");
+        assert_eq!(u1.cache_covered_est, 0);
         assert_eq!(u1.cache_read, 0);
 
         let turn2 = req_with_messages(vec![
@@ -1090,7 +1317,7 @@ mod tests {
             msg_with_cc("user", &body, false),
         ]);
         let u2 = compute_cache_usage(&cache, &turn2, 1);
-        assert!(u2.cache_read > 0, "无 cache_control 也应跨轮命中历史前缀");
+        assert_eq!(u2.cache_read, 0, "无 cache_control 不应模拟 cache 命中");
     }
 
     /// 复现实测根因：system[0] 是每轮变化的动态头（无 cache_control），
@@ -1168,6 +1395,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn anthropic_billing_header_drift_does_not_break_cache_hit() {
+        use super::super::types::{CacheControl, MessagesRequest, SystemMessage};
+        let make = |billing: &str| MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-sonnet-4.6".to_string(),
+            max_tokens: 64,
+            messages: vec![msg_with_cc("user", "latest question", false)],
+            stream: false,
+            system: Some(vec![
+                SystemMessage {
+                    text: "stable system prompt ".repeat(200),
+                    cache_control: Some(CacheControl {
+                        cache_type: "ephemeral".to_string(),
+                        ttl: None,
+                    }),
+                },
+                SystemMessage {
+                    text: billing.to_string(),
+                    cache_control: None,
+                },
+            ]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let cache = CacheMeter::new(None);
+        let first = compute_cache_usage(
+            &cache,
+            &make("x-anthropic-billing-header: cc_version=1; cch=aaaa;"),
+            1,
+        );
+        assert_eq!(first.cache_read, 0);
+        let second = compute_cache_usage(
+            &cache,
+            &make("x-anthropic-billing-header: cc_version=2; cch=bbbb;"),
+            1,
+        );
+        assert!(second.cache_read > 0);
+    }
+
     /// 会话隔离：相同前缀内容，不同客户端 Key（key_id）之间不应互相命中。
     #[test]
     fn different_key_id_does_not_cross_hit() {
@@ -1175,7 +1446,7 @@ mod tests {
         let body = "shared system prompt and history ".repeat(20);
         let msgs = || {
             vec![
-                msg_with_cc("user", &body, false),
+                msg_with_cc("user", &body, true),
                 msg_with_cc("assistant", &body, false),
                 msg_with_cc("user", &body, false),
             ]
@@ -1192,7 +1463,7 @@ mod tests {
         assert!(c.cache_read > 0, "同一 key_id 应命中自己的前缀");
     }
 
-    /// 会话隔离：metadata.user_id 里 session 不同 → 不命中；session 相同 → 命中。
+    /// Kiro-Go namespace 只按上游账号：metadata session 不再分割 cache。
     #[test]
     fn metadata_session_scopes_cache() {
         use super::super::types::{Message, MessagesRequest, Metadata};
@@ -1204,7 +1475,7 @@ mod tests {
             messages: vec![
                 Message {
                     role: "user".into(),
-                    content: serde_json::json!([{"type":"text","text":body}]),
+                    content: serde_json::json!([{"type":"text","text":body,"cache_control":{"type":"ephemeral"}}]),
                 },
                 Message {
                     role: "assistant".into(),
@@ -1226,13 +1497,10 @@ mod tests {
             }),
         };
         let cache = CacheMeter::new(None);
-        // 同 key_id（都为 0），仅 session 不同——靠 metadata session 隔离。
-        let s1a = compute_cache_usage(&cache, &make("aaa"), 0);
+        let s1a = compute_cache_usage(&cache, &make("aaa"), 1);
         assert_eq!(s1a.cache_read, 0);
-        let s2 = compute_cache_usage(&cache, &make("bbb"), 0);
-        assert_eq!(s2.cache_read, 0, "不同 session 不应命中");
-        let s1b = compute_cache_usage(&cache, &make("aaa"), 0);
-        assert!(s1b.cache_read > 0, "相同 session 应命中");
+        let s2 = compute_cache_usage(&cache, &make("bbb"), 1);
+        assert!(s2.cache_read > 0, "同一上游账号应跨 session 命中");
     }
 
     /// 主 apiKey（key_id=0）且无 session：该 Key 被多个用户共享，不应模拟出跨用户
@@ -1312,16 +1580,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extract_session_id_parses_claude_code_format() {
-        assert_eq!(
-            extract_session_id("user_xxx_account__session_0b4445e1-uuid"),
-            Some("0b4445e1-uuid".to_string())
-        );
-        assert_eq!(extract_session_id("no-session-here"), None);
-        assert_eq!(extract_session_id("trailing_session_"), None);
-    }
-
     /// token 口径纯净性：cum_tokens 只算原文，不含 role / 签名前缀 / 分隔符噪声。
     #[test]
     fn token_count_excludes_signature_noise() {
@@ -1335,7 +1593,7 @@ mod tests {
             messages: vec![
                 Message {
                     role: "user".to_string(),
-                    content: serde_json::json!([{"type": "text", "text": history_text}]),
+                    content: serde_json::json!([{"type": "text", "text": history_text, "cache_control":{"type":"ephemeral"}}]),
                 },
                 Message {
                     role: "assistant".to_string(),
@@ -1351,14 +1609,9 @@ mod tests {
             metadata: None,
         };
         let u = compute_cache_usage(&CacheMeter::new(None), &req, 1);
-        // 历史段（第一条）的 covered 应严格等于纯文本 estimate——
-        // 不含 "user" role、"block:" 前缀、"|" 分隔符的任何 token。
+        // request prelude 也参与 profile，covered 应至少包含纯文本。
         let pure = estimate_tokens(history_text) as i32;
-        assert_eq!(
-            u.cache_covered_est, pure,
-            "covered 应只算原文 token，实测 {} vs 纯文本 {}",
-            u.cache_covered_est, pure
-        );
+        assert!(u.cache_covered_est >= pure);
     }
 
     /// 含图片的历史段：covered 应计入图片的 Anthropic 口径 token，且跨轮稳定命中。
@@ -1382,7 +1635,7 @@ mod tests {
                     role: "user".to_string(),
                     content: serde_json::json!([
                         {"type":"image","source":{"type":"base64","media_type":"image/png","data": png}},
-                        {"type":"text","text":"describe"}
+                        {"type":"text","text":"describe","cache_control":{"type":"ephemeral"}}
                     ]),
                 },
                 Message {

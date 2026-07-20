@@ -1273,6 +1273,8 @@ impl SseStateManager {
         output_tokens: i32,
         cache_creation_input_tokens: i32,
         cache_read_input_tokens: i32,
+        cache_creation_5m_input_tokens: i32,
+        cache_creation_1h_input_tokens: i32,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -1305,7 +1307,11 @@ impl SseStateManager {
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
                         "cache_creation_input_tokens": cache_creation_input_tokens,
-                        "cache_read_input_tokens": cache_read_input_tokens
+                        "cache_read_input_tokens": cache_read_input_tokens,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": cache_creation_5m_input_tokens,
+                            "ephemeral_1h_input_tokens": cache_creation_1h_input_tokens
+                        }
                     }
                 }),
             ));
@@ -1336,10 +1342,14 @@ pub struct StreamContext {
     pub message_id: String,
     /// 输入 tokens（估算值）
     pub input_tokens: i32,
-    /// 从 contextUsageEvent 计算的实际输入 tokens
-    pub context_input_tokens: Option<i32>,
+    /// Kiro 上下文占用百分比；须在得到最终输出 token 后才能换算公开输入口径。
+    pub context_usage_percentage: Option<f64>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// 用整段内容重算 token，避免结果受上游 chunk 切分影响。
+    output_text: String,
+    output_thinking: String,
+    output_aux_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -1377,6 +1387,7 @@ pub struct StreamContext {
     /// 做互斥分摊：`input + cache_creation + cache_read == total`，避免把被缓存
     /// 覆盖的前缀重复计进 input_tokens。
     pub cache_usage: super::cache_metering::CacheUsage,
+    pub cache_meter: Option<super::cache_metering::SharedCacheMeter>,
     /// meteringEvent 上报的 credit 计费量（上游真实下发）
     pub credits: f64,
     /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
@@ -1400,17 +1411,42 @@ pub struct StreamContext {
 impl StreamContext {
     /// 解析最终上报口径的 `(input_tokens, cache_creation, cache_read)`。
     ///
-    /// total 真值优先取 contextUsage（上游真实百分比×窗口），否则用客户端估算的
-    /// `input_tokens`；再由 [`CacheUsage::split_against_total`] 做互斥分摊。
+    /// public total 优先由 contextUsage 经 Kiro-Go 公开口径校正得到，
+    /// 否则用请求估算值；再由 cache profile 做互斥分摊。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
-        let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
-        self.cache_usage.split_against_total(total_real)
+        let usage = self.resolved_cache_usage();
+        (usage.input, usage.creation, usage.read)
+    }
+
+    pub fn resolved_cache_usage(&self) -> super::cache_metering::ResolvedCacheUsage {
+        let total_real = crate::token::finalize_public_input_tokens(
+            self.input_tokens,
+            self.context_usage_percentage,
+            get_context_window_size(&self.model),
+            self.output_tokens,
+        );
+        self.cache_usage.resolve_against_total(total_real)
+    }
+
+    fn refresh_output_tokens(&mut self) {
+        self.output_tokens = estimate_tokens(&self.output_text)
+            + estimate_tokens(&self.output_thinking)
+            + self.output_aux_tokens;
+        if self.output_tokens <= 0 {
+            self.output_tokens = 1;
+        }
     }
 
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
     /// 或在非流式路径返回 502。无错误时返回 `None`。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.tool_json_error.as_ref().map(|err| err.message())
+    }
+
+    pub fn commit_cache(&self) {
+        if let Some(cache) = &self.cache_meter {
+            self.cache_usage.commit(cache);
+        }
     }
 
     /// 创建 StreamContext
@@ -1426,8 +1462,11 @@ impl StreamContext {
             model: model.into(),
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
-            context_input_tokens: None,
+            context_usage_percentage: None,
             output_tokens: 0,
+            output_text: String::new(),
+            output_thinking: String::new(),
+            output_aux_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             known_tool_names,
@@ -1443,6 +1482,7 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
+            cache_meter: None,
             credits: 0.0,
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
@@ -1521,20 +1561,15 @@ impl StreamContext {
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::ContextUsage(context_usage) => {
-                // 从上下文使用百分比计算实际的 input_tokens
-                let window_size = get_context_window_size(&self.model);
-                let actual_input_tokens =
-                    (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
-                self.context_input_tokens = Some(actual_input_tokens);
+                self.context_usage_percentage = Some(context_usage.context_usage_percentage);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
                     self.state_manager
                         .set_stop_reason("model_context_window_exceeded");
                 }
                 tracing::debug!(
-                    "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                    context_usage.context_usage_percentage,
-                    actual_input_tokens
+                    "收到 contextUsageEvent: {}%",
+                    context_usage.context_usage_percentage
                 );
                 Vec::new()
             }
@@ -1582,8 +1617,8 @@ impl StreamContext {
             events.extend(self.close_open_thinking_block());
         }
 
-        // 估算 tokens
-        self.output_tokens += estimate_tokens(content);
+        self.output_text.push_str(content);
+        self.refresh_output_tokens();
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
@@ -2104,7 +2139,8 @@ impl StreamContext {
             if let Some(text) = reasoning.text.as_deref()
                 && !text.is_empty()
             {
-                self.output_tokens += estimate_tokens(text);
+                self.output_text.push_str(text);
+                self.refresh_output_tokens();
                 return self.create_text_delta_events(text);
             }
             return Vec::new();
@@ -2121,7 +2157,8 @@ impl StreamContext {
         if let Some(text) = reasoning.text.as_deref()
             && !text.is_empty()
         {
-            self.output_tokens += estimate_tokens(text);
+            self.output_thinking.push_str(text);
+            self.refresh_output_tokens();
             events.extend(self.ensure_thinking_block());
             if let Some(idx) = self.thinking_block_index {
                 events.push(self.create_thinking_delta_event(idx, text));
@@ -2131,7 +2168,8 @@ impl StreamContext {
         if let Some(redacted) = reasoning.redacted_content.as_deref()
             && !redacted.is_empty()
         {
-            self.output_tokens += 8;
+            self.output_aux_tokens += 8;
+            self.refresh_output_tokens();
             events.extend(self.create_redacted_thinking_events(redacted));
         }
 
@@ -2212,6 +2250,10 @@ impl StreamContext {
         let mut events = Vec::new();
         self.state_manager.set_has_tool_use(true);
 
+        self.output_aux_tokens +=
+            estimate_tokens(&completed.name) + estimate_tokens(&completed.input.to_string());
+        self.refresh_output_tokens();
+
         let block_index = if let Some(&idx) = self.tool_block_indices.get(&completed.id) {
             idx
         } else {
@@ -2236,7 +2278,6 @@ impl StreamContext {
         ));
 
         // 一次性发出完整参数 JSON（来源已保证是合法 JSON）。
-        self.output_tokens += estimate_tokens(&completed.input.to_string());
         if let Some(delta_event) = self.state_manager.handle_content_block_delta(
             block_index,
             json!({
@@ -2460,14 +2501,16 @@ impl StreamContext {
         }
 
         // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
-        let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
+        let usage = self.resolved_cache_usage();
 
         // 生成最终事件（message_delta + message_stop）
         events.extend(self.state_manager.generate_final_events(
-            final_input_tokens,
+            usage.input,
             self.output_tokens,
-            cache_creation,
-            cache_read,
+            usage.creation,
+            usage.read,
+            usage.creation_5m,
+            usage.creation_1h,
         ));
 
         // 工具调用 JSON 错误：在最终事件之后补一个 Anthropic `error` 事件，明确告知
@@ -2532,8 +2575,13 @@ impl BufferedStreamContext {
     }
 
     /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
-    pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
+    pub fn set_cache_usage(
+        &mut self,
+        cache_usage: super::cache_metering::CacheUsage,
+        cache_meter: Option<super::cache_metering::SharedCacheMeter>,
+    ) {
         self.inner.cache_usage = cache_usage;
+        self.inner.cache_meter = cache_meter;
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -2567,7 +2615,7 @@ impl BufferedStreamContext {
         }
 
         // 互斥口径分摊：total 真值 − 缓存覆盖 = 未缓存 input（与 inner 收尾一致）。
-        let (final_input_tokens, cache_creation, cache_read) = self.inner.resolved_usage();
+        let resolved = self.inner.resolved_cache_usage();
 
         // 生成最终事件（StreamContext 内部会用同样的优先级与分摊）
         let final_events = self.inner.generate_final_events();
@@ -2578,9 +2626,13 @@ impl BufferedStreamContext {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
-                        usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
-                        usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
+                        usage["input_tokens"] = serde_json::json!(resolved.input);
+                        usage["cache_creation_input_tokens"] = serde_json::json!(resolved.creation);
+                        usage["cache_read_input_tokens"] = serde_json::json!(resolved.read);
+                        usage["cache_creation"] = serde_json::json!({
+                            "ephemeral_5m_input_tokens": resolved.creation_5m,
+                            "ephemeral_1h_input_tokens": resolved.creation_1h
+                        });
                     }
                 }
             }
@@ -2607,29 +2659,17 @@ impl BufferedStreamContext {
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.inner.tool_json_error_message()
     }
+
+    pub fn commit_cache(&self) {
+        self.inner.commit_cache();
+    }
 }
 
 /// 简单的 token 估算（中英文字符混合）
 ///
 /// 公开供 cache_meter 等模块复用同一估算口径。
 pub fn estimate_tokens(text: &str) -> i32 {
-    let chars: Vec<char> = text.chars().collect();
-    let mut chinese_count = 0;
-    let mut other_count = 0;
-
-    for c in &chars {
-        if *c >= '\u{4E00}' && *c <= '\u{9FFF}' {
-            chinese_count += 1;
-        } else {
-            other_count += 1;
-        }
-    }
-
-    // 中文约 1.5 字符/token，英文约 4 字符/token
-    let chinese_tokens = (chinese_count * 2 + 2) / 3;
-    let other_tokens = (other_count + 3) / 4;
-
-    (chinese_tokens + other_tokens).max(1)
+    crate::token::estimate_approx_tokens(text)
 }
 
 #[cfg(test)]
@@ -3201,6 +3241,28 @@ mod tests {
         assert!(estimate_tokens("Hello") > 0);
         assert!(estimate_tokens("你好") > 0);
         assert!(estimate_tokens("Hello 你好") > 0);
+    }
+
+    #[test]
+    fn output_tokens_do_not_depend_on_stream_chunk_boundaries() {
+        let make = || {
+            StreamContext::new_with_thinking(
+                "test-model",
+                1,
+                false,
+                HashMap::new(),
+                std::collections::HashSet::new(),
+            )
+        };
+        let mut whole = make();
+        whole.process_assistant_response("hello world from kiro");
+
+        let mut chunked = make();
+        chunked.process_assistant_response("hello ");
+        chunked.process_assistant_response("world ");
+        chunked.process_assistant_response("from kiro");
+
+        assert_eq!(whole.output_tokens, chunked.output_tokens);
     }
 
     #[test]

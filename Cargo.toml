@@ -41,6 +41,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 base64 = "0.22"
 thiserror = "1"
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
+tiktoken-rs = "0.12"  # 与 Kiro-Go 一致：用 cl100k_base 统一估算 Claude 公开 token 口径
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
 flate2 = "1"        # tar.gz 解压（在线更新）

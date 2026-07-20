@@ -400,9 +400,30 @@ pub(super) fn map_provider_error(err: Error) -> Response {
 /// 计算 Anthropic usage 口径的 input_tokens
 fn resolve_usage_input_tokens(
     fallback_total_input_tokens: i32,
-    context_total_input_tokens: Option<i32>,
+    context_usage_percentage: Option<f64>,
+    output_tokens: i32,
+    model: &str,
 ) -> i32 {
-    context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
+    token::finalize_public_input_tokens(
+        fallback_total_input_tokens,
+        context_usage_percentage,
+        super::converter::get_context_window_size(model),
+        output_tokens,
+    )
+}
+
+struct RequestMetering {
+    input_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
+    cache_meter: Option<super::cache_metering::SharedCacheMeter>,
+}
+
+impl RequestMetering {
+    fn commit_cache(&self) {
+        if let Some(cache) = &self.cache_meter {
+            self.cache_usage.commit(cache);
+        }
+    }
 }
 
 fn available_models() -> Vec<Model> {
@@ -807,20 +828,26 @@ pub async fn post_messages(
     // 打包成一个延迟闭包，由下游 handler 在 call_api[_stream] 返回后、构建响应上下文前调用。
     let compute_metering = {
         let cache_meter = state.cache_meter.clone();
-        let key_id = key_ctx.key_id;
         // payload 移入闭包（此处之后不再需要 payload 本体，request_body 已序列化）
-        move || -> (i32, super::cache_metering::CacheUsage) {
+        move |credential_id: u64| -> RequestMetering {
             let total_input_tokens = token::count_all_tokens(
                 &payload.model,
                 payload.system.as_deref(),
                 &payload.messages,
                 payload.tools.as_deref(),
             ) as i32;
-            let cache_usage = cache_meter
+            let mut cache_usage = cache_meter
                 .as_ref()
-                .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_id))
+                .map(|cache| {
+                    super::cache_metering::compute_cache_usage(cache, &payload, credential_id)
+                })
                 .unwrap_or_default();
-            (total_input_tokens, cache_usage)
+            cache_usage.align_prompt_total_estimate(total_input_tokens);
+            RequestMetering {
+                input_tokens: total_input_tokens,
+                cache_usage,
+                cache_meter,
+            }
         }
     };
 
@@ -878,7 +905,7 @@ async fn handle_stream_request(
     model: &str,
     // 延迟计量：在上游 call_api_stream 返回后才调用，避免把 O(会话长度) 的
     // token 估算 + CacheMeter 查写坐在首字关键路径上。
-    compute_metering: impl FnOnce() -> (i32, super::cache_metering::CacheUsage),
+    compute_metering: impl FnOnce(u64) -> RequestMetering,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
@@ -895,8 +922,8 @@ async fn handle_stream_request(
         Err(e) => {
             // 上游整链失败：此时仍需 input_tokens 记一次 error 用量。计量在此惰性求值，
             // 不影响首字（首字已失败）。
-            let (input_tokens, _) = compute_metering();
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+            let metering = compute_metering(0);
+            hook.record(0, metering.input_tokens, 0, 0, 0, 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
             tracer.finalize(
                 "error",
@@ -913,18 +940,19 @@ async fn handle_stream_request(
 
     // 上游已返回（首字已拿到）：此刻再做计量，不阻塞 TTFT。
     let stage_metering_start = Instant::now();
-    let (input_tokens, cache_usage) = compute_metering();
+    let metering = compute_metering(credential_id);
     tracer.mark_stage("metering", stage_metering_start.elapsed());
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(
         model,
-        input_tokens,
+        metering.input_tokens,
         thinking_enabled,
         tool_name_map,
         known_tool_names,
     );
-    ctx.cache_usage = cache_usage;
+    ctx.cache_usage = metering.cache_usage;
+    ctx.cache_meter = metering.cache_meter;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1047,6 +1075,7 @@ fn create_sse_stream(
                                     stream_trace_usage(&ctx),
                                 );
                             } else {
+                                ctx.commit_cache();
                                 record_stream_usage(&hook, &ctx, credential_id, "success");
                                 tracer.finalize(
                                     "success",
@@ -1114,15 +1143,13 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
     }
 }
 
-use super::converter::get_context_window_size;
-
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
     // 延迟计量：上游返回后才求值，不阻塞响应（见 handle_stream_request 同款说明）。
-    compute_metering: impl FnOnce() -> (i32, super::cache_metering::CacheUsage),
+    compute_metering: impl FnOnce(u64) -> RequestMetering,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探，
@@ -1140,8 +1167,8 @@ async fn handle_non_stream_request(
         Ok(resp) => resp,
         Err(e) => {
             // 上游整链失败：惰性求值计量记一次 error 用量（不影响响应，已失败）。
-            let (input_tokens, _) = compute_metering();
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+            let metering = compute_metering(0);
+            hook.record(0, metering.input_tokens, 0, 0, 0, 0.0, "error");
             tracer.finalize(
                 "error",
                 last_attempt_outcome(&tracer),
@@ -1153,12 +1180,14 @@ async fn handle_non_stream_request(
         }
     };
 
-    // 上游已返回：此刻求值计量，不阻塞响应返回。
-    let stage_metering_start = Instant::now();
-    let (input_tokens, cache_usage) = compute_metering();
-    tracer.mark_stage("metering", stage_metering_start.elapsed());
     let response = call_result.response;
     let credential_id = call_result.credential_id;
+
+    // 上游已返回：此刻求值计量，不阻塞响应返回。
+    let stage_metering_start = Instant::now();
+    let metering = compute_metering(credential_id);
+    let input_tokens = metering.input_tokens;
+    tracer.mark_stage("metering", stage_metering_start.elapsed());
 
     // 读取响应体
     let stage_decode_start = Instant::now();
@@ -1198,8 +1227,8 @@ async fn handle_non_stream_request(
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
-    // 从 contextUsageEvent 计算的实际输入 tokens
-    let mut context_input_tokens: Option<i32> = None;
+    // Kiro 上下文占用百分比，待输出 token 确定后再换算公开输入口径。
+    let mut context_usage_percentage: Option<f64> = None;
     // meteringEvent 上报的 credit 计费量（上游真实下发）；
     // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
@@ -1248,20 +1277,14 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = get_context_window_size(model);
-                            let actual_input_tokens =
-                                (context_usage.context_usage_percentage * (window_size as f64)
-                                    / 100.0) as i32;
-                            context_input_tokens = Some(actual_input_tokens);
+                            context_usage_percentage = Some(context_usage.context_usage_percentage);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
                             tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
-                                context_usage.context_usage_percentage,
-                                actual_input_tokens
+                                "收到 contextUsageEvent: {}%",
+                                context_usage.context_usage_percentage
                             );
                         }
                         Event::Metering(metering) => {
@@ -1334,10 +1357,15 @@ async fn handle_non_stream_request(
     let output_tokens = token::estimate_output_tokens(&content);
 
     // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
-    let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
+    let total_input_tokens =
+        resolve_usage_input_tokens(input_tokens, context_usage_percentage, output_tokens, model);
     // 互斥分摊：input + cache_creation + cache_read == total
-    let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        cache_usage.split_against_total(total_input_tokens);
+    let resolved_cache = metering
+        .cache_usage
+        .resolve_against_total(total_input_tokens);
+    let final_input_tokens = resolved_cache.input;
+    let cache_creation_tokens = resolved_cache.creation;
+    let cache_read_tokens = resolved_cache.read;
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1352,12 +1380,17 @@ async fn handle_non_stream_request(
             "input_tokens": final_input_tokens,
             "output_tokens": output_tokens,
             "cache_creation_input_tokens": cache_creation_tokens,
-            "cache_read_input_tokens": cache_read_tokens
+            "cache_read_input_tokens": cache_read_tokens,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": resolved_cache.creation_5m,
+                "ephemeral_1h_input_tokens": resolved_cache.creation_1h
+            }
         }
     });
 
     // decode=读响应体 + 解析事件流的耗时（非流式路径）
     tracer.mark_stage("decode", stage_decode_start.elapsed());
+    metering.commit_cache();
     hook.record(
         credential_id,
         final_input_tokens,
@@ -1673,19 +1706,25 @@ pub async fn post_messages_cc(
     // 计量延后到上游返回后再算，避免坐在首字关键路径上（详见 stream_request 同款说明）。
     let compute_metering = {
         let cache_meter = state.cache_meter.clone();
-        let key_id = key_ctx.key_id;
-        move || -> (i32, super::cache_metering::CacheUsage) {
+        move |credential_id: u64| -> RequestMetering {
             let total_input_tokens = token::count_all_tokens(
                 &payload.model,
                 payload.system.as_deref(),
                 &payload.messages,
                 payload.tools.as_deref(),
             ) as i32;
-            let cache_usage = cache_meter
+            let mut cache_usage = cache_meter
                 .as_ref()
-                .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_id))
+                .map(|cache| {
+                    super::cache_metering::compute_cache_usage(cache, &payload, credential_id)
+                })
                 .unwrap_or_default();
-            (total_input_tokens, cache_usage)
+            cache_usage.align_prompt_total_estimate(total_input_tokens);
+            RequestMetering {
+                input_tokens: total_input_tokens,
+                cache_usage,
+                cache_meter,
+            }
         }
     };
 
@@ -1748,7 +1787,7 @@ async fn handle_stream_request_buffered(
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     // 延迟计量：上游返回后才求值，不阻塞首字（详见 handle_stream_request 说明）。
-    compute_metering: impl FnOnce() -> (i32, super::cache_metering::CacheUsage),
+    compute_metering: impl FnOnce(u64) -> RequestMetering,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
@@ -1759,8 +1798,8 @@ async fn handle_stream_request_buffered(
     {
         Ok(resp) => resp,
         Err(e) => {
-            let (fallback_input_tokens, _) = compute_metering();
-            hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+            let metering = compute_metering(0);
+            hook.record(0, metering.input_tokens, 0, 0, 0, 0.0, "error");
             tracer.finalize(
                 "error",
                 last_attempt_outcome(&tracer),
@@ -1776,18 +1815,18 @@ async fn handle_stream_request_buffered(
 
     // 上游已返回：此刻求值计量，不阻塞首字。
     let stage_metering_start = Instant::now();
-    let (fallback_input_tokens, cache_usage) = compute_metering();
+    let metering = compute_metering(credential_id);
     tracer.mark_stage("metering", stage_metering_start.elapsed());
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(
         model,
-        fallback_input_tokens,
+        metering.input_tokens,
         thinking_enabled,
         tool_name_map,
         known_tool_names,
     );
-    ctx.set_cache_usage(cache_usage);
+    ctx.set_cache_usage(metering.cache_usage, metering.cache_meter);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
@@ -1923,6 +1962,7 @@ fn create_buffered_sse_stream(
                                         trace_usage,
                                     );
                                 } else {
+                                    ctx.commit_cache();
                                     hook.record(credential_id, i, o, cc, cr, credits, "success");
                                     tracer.finalize("success", None, None, None, trace_usage);
                                 }
@@ -1983,17 +2023,13 @@ mod tests {
         let resp = map_provider_error(err.into());
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            resp.headers().get(header::RETRY_AFTER).unwrap(),
-            "1800"
-        );
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "1800");
     }
 
     #[test]
     fn upstream_rate_limit_drops_invalid_retry_after() {
-        let err = crate::kiro::error::UpstreamRateLimitError::new(Some(
-            "not-a-retry-delay".to_string(),
-        ));
+        let err =
+            crate::kiro::error::UpstreamRateLimitError::new(Some("not-a-retry-delay".to_string()));
         let resp = map_provider_error(err.into());
 
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);

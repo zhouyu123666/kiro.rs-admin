@@ -42,8 +42,8 @@ struct RoundOutcome {
     text: String,
     /// The complete tool_use for this round (name already restored via tool_name_map)
     tool_uses: Vec<CompletedToolUse>,
-    /// Actual input tokens computed from contextUsageEvent
-    context_input_tokens: Option<i32>,
+    /// Kiro context usage percentage; public input is finalized after output is known.
+    context_usage_percentage: Option<f64>,
     /// Cumulative credits from meteringEvent
     credits: f64,
     /// stop_reason override (max_tokens / model_context_window_exceeded)
@@ -83,7 +83,7 @@ fn should_search_round(round_idx: usize, tool_uses: &[CompletedToolUse]) -> bool
 /// Buffer-decode one round of the upstream streaming response
 async fn decode_round(
     response: reqwest::Response,
-    model: &str,
+    _model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
@@ -95,7 +95,7 @@ async fn decode_round(
         std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut tool_uses: Vec<CompletedToolUse> = Vec::new();
-    let mut context_input_tokens: Option<i32> = None;
+    let mut context_usage_percentage: Option<f64> = None;
     let mut credits = 0.0;
     let mut stop_reason_override: Option<String> = None;
     let mut stream_error = false;
@@ -137,9 +137,7 @@ async fn decode_round(
                     entry.1.push_str(&tu.input);
                 }
                 Event::ContextUsage(cu) => {
-                    let window = get_context_window_size(model);
-                    let actual = (cu.context_usage_percentage * (window as f64) / 100.0) as i32;
-                    context_input_tokens = Some(actual);
+                    context_usage_percentage = Some(cu.context_usage_percentage);
                     if cu.context_usage_percentage >= 100.0 {
                         stop_reason_override = Some("model_context_window_exceeded".to_string());
                     }
@@ -177,7 +175,7 @@ async fn decode_round(
     RoundOutcome {
         text,
         tool_uses,
-        context_input_tokens,
+        context_usage_percentage,
         credits,
         stop_reason_override,
         stream_error,
@@ -530,24 +528,24 @@ pub(super) async fn run_web_search_loop(
     group: Option<String>,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Response {
-    let fallback_input_tokens = token::count_all_tokens(
-        &payload.model,
-        payload.system.as_deref(),
-        &payload.messages,
-        payload.tools.as_deref(),
-    ) as i32;
-
     let mut presentation: Vec<Value> = Vec::new();
     let mut last_credential_id: u64 = 0;
-    let mut last_context_input: Option<i32> = None;
+    let mut total_public_input = 0;
+    let mut total_internal_output = 0;
     let mut total_credits = 0.0;
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
+        let round_estimated_input = token::count_all_tokens(
+            &payload.model,
+            payload.system.as_deref(),
+            &payload.messages,
+            payload.tools.as_deref(),
+        ) as i32;
         let (round, credential_id) = match run_round(
             &provider,
             &payload,
             &hook,
-            fallback_input_tokens,
+            round_estimated_input,
             group.as_deref(),
             tool_compatibility_mode,
         )
@@ -557,7 +555,23 @@ pub(super) async fn run_web_search_loop(
             Err(resp) => return resp,
         };
         last_credential_id = credential_id;
-        last_context_input = round.context_input_tokens.or(last_context_input);
+        let round_output = token::estimate_approx_tokens(&round.text)
+            + round
+                .tool_uses
+                .iter()
+                .map(|tool| {
+                    token::estimate_approx_tokens(&tool.name)
+                        + token::estimate_approx_tokens(&tool.input.to_string())
+                })
+                .sum::<i32>();
+        let round_public_input = token::finalize_public_input_tokens(
+            round_estimated_input,
+            round.context_usage_percentage,
+            get_context_window_size(&payload.model),
+            round_output,
+        );
+        total_public_input += round_public_input;
+        total_internal_output += round_output.max(0);
         total_credits += round.credits;
 
         if should_search_round(round_idx, &round.tool_uses) {
@@ -572,8 +586,8 @@ pub(super) async fn run_web_search_loop(
                         tracing::warn!("web_search MCP call failed: {}", e);
                         hook.record(
                             last_credential_id,
-                            fallback_input_tokens,
-                            0,
+                            total_public_input,
+                            total_internal_output,
                             0,
                             0,
                             total_credits,
@@ -593,7 +607,6 @@ pub(super) async fn run_web_search_loop(
         // web_search must end as "end_turn", not "tool_use" (otherwise the host would
         // wait for a client tool call that is never emitted).
         let (_web_uses, client_uses) = partition_tool_uses(&round.tool_uses);
-        let final_input = last_context_input.unwrap_or(fallback_input_tokens);
         // INVARIANT: web_search is ALWAYS executed internally and is NEVER flushed
         // as a raw tool_use (the Codex host has no executor for it and rejects it
         // with "unsupported call: web_search"). This covers the mixed-round case
@@ -613,8 +626,8 @@ pub(super) async fn run_web_search_loop(
                         tracing::warn!("web_search MCP call (final round) failed: {}", e);
                         hook.record(
                             last_credential_id,
-                            fallback_input_tokens,
-                            0,
+                            total_public_input,
+                            total_internal_output,
                             0,
                             0,
                             total_credits,
@@ -646,10 +659,11 @@ pub(super) async fn run_web_search_loop(
         );
 
         let output_tokens = token::estimate_output_tokens(&content);
+        let final_input = round_public_input;
         hook.record(
             last_credential_id,
-            final_input,
-            output_tokens,
+            total_public_input,
+            total_internal_output,
             0,
             0,
             total_credits,
@@ -678,8 +692,8 @@ pub(super) async fn run_web_search_loop(
     // Theoretically unreachable (the loop always returns)
     hook.record(
         last_credential_id,
-        fallback_input_tokens,
-        0,
+        total_public_input,
+        total_internal_output,
         0,
         0,
         total_credits,
