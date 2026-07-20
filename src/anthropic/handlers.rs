@@ -1227,7 +1227,7 @@ async fn handle_non_stream_request(
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
-    // Kiro 上下文占用百分比，待输出 token 确定后再换算公开输入口径。
+    // Kiro 上下文占用百分比，是最终输入计费的首要依据。
     let mut context_usage_percentage: Option<f64> = None;
     // meteringEvent 上报的 credit 计费量（上游真实下发）；
     // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
@@ -1356,7 +1356,7 @@ async fn handle_non_stream_request(
     // 估算输出 tokens（上游不下发 token，全部走估算）
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
+    // 输入 tokens 优先使用 Kiro contextUsage 直接换算，缺失时回退请求计数。
     let total_input_tokens =
         resolve_usage_input_tokens(input_tokens, context_usage_percentage, output_tokens, model);
     // 互斥分摊：input + cache_creation + cache_read == total

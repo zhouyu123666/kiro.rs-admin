@@ -1342,7 +1342,7 @@ pub struct StreamContext {
     pub message_id: String,
     /// 输入 tokens（估算值）
     pub input_tokens: i32,
-    /// Kiro 上下文占用百分比；须在得到最终输出 token 后才能换算公开输入口径。
+    /// Kiro 上下文占用百分比，是最终输入计费的首要依据。
     pub context_usage_percentage: Option<f64>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
@@ -1411,8 +1411,8 @@ pub struct StreamContext {
 impl StreamContext {
     /// 解析最终上报口径的 `(input_tokens, cache_creation, cache_read)`。
     ///
-    /// public total 优先由 contextUsage 经 Kiro-Go 公开口径校正得到，
-    /// 否则用请求估算值；再由 cache profile 做互斥分摊。
+    /// public total 优先使用 Kiro contextUsage 直接换算，缺失时回退请求计数；
+    /// 再由 cache profile 做互斥分摊。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
         let usage = self.resolved_cache_usage();
         (usage.input, usage.creation, usage.read)

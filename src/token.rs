@@ -1,8 +1,9 @@
 //! Token 计量模块。
 //!
-//! 公开请求口径与 Kiro-Go 保持一致：使用 `cl100k_base` 统一分词，
-//! 再应用 Claude 1.10 校正系数。输出与 prompt-cache profile 使用同一套
-//! 轻量词法估算，避免流式/非流式因为两套字符倍率产生大幅偏差。
+//! 客户端可见的输入用量优先由 Kiro `contextUsagePercentage` 与模型窗口
+//! 直接换算。百分比缺失、为零或无效时，才回退到请求内容计数：
+//! 优先使用配置的 `count_tokens` API，失败时用 `cl100k_base` 本地估算。
+//! 不再对 Kiro 换算值扣固定隐藏 token 或乘额外校正系数，避免档位失真。
 
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
@@ -12,9 +13,6 @@ use crate::model::config::TlsBackend;
 use std::sync::OnceLock;
 
 const CLAUDE_TOKEN_CORRECTION_FACTOR: f64 = 1.10;
-const CLAUDE_PUBLIC_CONTEXT_USAGE_CORRECTION_FACTOR: f64 = 1.843;
-const CLAUDE_PUBLIC_CONTEXT_USAGE_MIN_TOKENS: i32 = 8;
-const KIRO_DEFAULT_SYSTEM_PROMPT_TOKENS: i32 = 6_970;
 const APPROX_IMAGE_INPUT_TOKENS: u64 = 100;
 const APPROX_DOCUMENT_INPUT_TOKENS: u64 = 3_000;
 
@@ -336,32 +334,27 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     total.max(1)
 }
 
-/// 用 Kiro contextUsagePercentage 生成客户端可见的 public total input。
+/// 生成客户端可见的 public total input。
 ///
-/// 顺序与 Kiro-Go 一致：上下文占用先扣同轮输出，再扣 6970 个
-/// Kiro 隐藏系统 token，最后乘 1.843 映射到公开 Claude token 口径。
+/// Kiro 百分比是首要依据：先换算已占用上下文，再扣掉同轮输出。
+/// 请求计数只在百分比不可用时回退。不扣固定的 Kiro 隐藏系统 token，
+/// 也不再乘 1.843，因为 R8 实测表明百分比的直接换算值已与基线一致。
 pub(crate) fn finalize_public_input_tokens(
     estimated_input_tokens: i32,
     context_usage_percentage: Option<f64>,
     context_window: i32,
     output_tokens: i32,
 ) -> i32 {
-    let mut input = if let Some(percentage) = context_usage_percentage.filter(|v| *v > 0.0) {
-        let occupied = ((context_window as f64) * percentage / 100.0).round() as i32;
-        let context_input = (occupied - output_tokens.max(0)).max(0);
-        let visible = context_input - KIRO_DEFAULT_SYSTEM_PROMPT_TOKENS;
-        if visible <= 0 {
-            CLAUDE_PUBLIC_CONTEXT_USAGE_MIN_TOKENS
-        } else {
-            ((visible as f64) * CLAUDE_PUBLIC_CONTEXT_USAGE_CORRECTION_FACTOR)
-                .round()
-                .max(CLAUDE_PUBLIC_CONTEXT_USAGE_MIN_TOKENS as f64) as i32
-        }
-    } else {
-        estimated_input_tokens.max(0)
+    let fallback = estimated_input_tokens.max(0);
+    let Some(percentage) =
+        context_usage_percentage.filter(|value| value.is_finite() && *value > 0.0)
+    else {
+        return fallback;
     };
-    input = input.clamp(0, context_window.max(0));
-    input
+
+    let window = context_window.max(0);
+    let occupied = ((window as f64) * percentage / 100.0).round() as i32;
+    (occupied - output_tokens.max(0)).clamp(0, window)
 }
 
 #[cfg(test)]
@@ -400,14 +393,33 @@ mod tests {
     }
 
     #[test]
-    fn public_context_usage_matches_kiro_go_calibration() {
-        // round(1_000_000 * 1%) - output(100) - hidden(6970) = 2930;
-        // round(2930 * 1.843) = 5400.
+    fn public_input_tokens_follow_direct_kiro_percentage_across_r8_samples() {
+        let samples = [
+            (0.6546, 6_545),
+            (0.6956, 6_955),
+            (1.0064, 10_063),
+            (4.2027, 42_026),
+            (18.4126, 184_125),
+        ];
+        for (percentage, expected) in samples {
+            assert_eq!(
+                finalize_public_input_tokens(123, Some(percentage), 1_000_000, 1),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn public_input_tokens_fall_back_when_kiro_percentage_is_unavailable() {
+        assert_eq!(finalize_public_input_tokens(123, None, 1_000_000, 1), 123);
         assert_eq!(
-            finalize_public_input_tokens(123, Some(1.0), 1_000_000, 100),
-            5_400
+            finalize_public_input_tokens(123, Some(0.0), 1_000_000, 1),
+            123
         );
-        assert_eq!(finalize_public_input_tokens(123, None, 1_000_000, 100), 123);
+        assert_eq!(
+            finalize_public_input_tokens(123, Some(f64::NAN), 1_000_000, 1),
+            123
+        );
     }
 
     #[test]

@@ -42,7 +42,7 @@ struct RoundOutcome {
     text: String,
     /// The complete tool_use for this round (name already restored via tool_name_map)
     tool_uses: Vec<CompletedToolUse>,
-    /// Kiro context usage percentage; public input is finalized after output is known.
+    /// Kiro context usage percentage; primary source for this round's public input usage.
     context_usage_percentage: Option<f64>,
     /// Cumulative credits from meteringEvent
     credits: f64,
