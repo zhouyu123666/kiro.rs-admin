@@ -566,10 +566,10 @@ fn find_next_param_open(body: &str, from: usize) -> Option<usize> {
 /// 实测里 `<invoke>` 前常出现一行裸 `call`/`count`，需要从块前叙述文本里剥掉，
 /// 避免泄漏给客户端。只剥“尾部、且独占一行”的 stray token，前面的正常叙述保留。
 /// 已实测到的 stray token 集合：Opus 长上下文退化时，泄漏的 `<invoke>` 前常有一行裸的
-/// `call` / `count` / `card`。集合形式便于以后扩充。
-const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card"];
+/// `call` / `count` / `card` / `course` / `court`。集合形式便于以后扩充。
+const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card", "course", "court"];
 
-/// 复读熔断阈值：同一个 stray token（call/count/card）连续作为独占一行重复出现
+/// 复读熔断阈值：同一个 stray token（call/count/card/course/court）连续作为独占一行重复出现
 /// 超过这么多次，判定为「Opus 长上下文退化复读死循环」，立即熔断本轮文本输出。
 ///
 /// 取值权衡：正常工具调用前最多出现 1 个引导词行（偶有 2~3），绝不会连续几十次。
@@ -581,7 +581,8 @@ const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 32;
 /// 用于非流式 / web_search loop 路径（`extract_invoke_content_blocks` 入口）——
 /// 那条路不经过流式 `emit_text_delta_raw` 的逐 chunk 熔断，所以在这里独立兜一次。
 ///
-/// 规则与流式版一致：同一个 `STRAY_INVOKE_TOKENS`（call/count/card）连续作为独占一行
+/// 规则与流式版一致：同一个 `STRAY_INVOKE_TOKENS`
+///（call/count/card/course/court）连续作为独占一行
 /// 重复超过 `REPEAT_GUARD_TRIP_THRESHOLD` 次，判定为 Opus 退化复读，**从超阈值处截断**，
 /// 丢弃其后的全部复读垃圾（断雪球、不灌历史）。阈值内的少量引导词重复原样保留。
 fn collapse_stray_token_floods(text: &str) -> std::borrow::Cow<'_, str> {
@@ -4854,6 +4855,40 @@ mod tests {
         // 正常开头那句话必须保留（熔断不能误伤正文）
         assert!(
             text.contains("先看 crawlee 状态"),
+            "熔断不应误伤正常正文: {:?}",
+            &text[..text.len().min(80)]
+        );
+    }
+
+    /// 回归真实样本：模型在长上下文中连续复读 `course` 时必须触发熔断。
+    #[test]
+    fn repeat_guard_trips_on_course_flood() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut payload = String::from("旧格式迁移正确。\n\n");
+        for _ in 0..5000 {
+            payload.push_str("course\n\n");
+        }
+
+        let mut all = ctx.process_assistant_response(&payload);
+        all.extend(ctx.generate_final_events());
+
+        let text = collect_text_content(&all);
+        let emitted_courses = text.matches("course").count();
+        assert!(
+            emitted_courses < 64,
+            "course 复读应被熔断：实际吐出 course={}",
+            emitted_courses
+        );
+        assert!(
+            text.contains("旧格式迁移正确"),
             "熔断不应误伤正常正文: {:?}",
             &text[..text.len().min(80)]
         );
