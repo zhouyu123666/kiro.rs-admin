@@ -617,11 +617,33 @@ impl KiroCredentials {
     }
 
     /// 获取有效的 API Region（用于 API 请求）
-    /// 优先级：凭据.api_region > config.api_region > config.region
+    ///
+    /// 优先级：凭据.api_region > config.api_region > 真实 profileArn 的 region > config.region。
+    /// Enterprise / IdC 凭据通常只携带 SSO region；解析真实 profileArn 后必须调用
+    /// 同一区域的数据面，否则上游会返回 `400 Improperly formed request`。
     pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
         self.api_region
             .as_deref()
-            .unwrap_or(config.effective_api_region())
+            .or(config.api_region.as_deref())
+            .or_else(|| self.profile_arn_region())
+            .unwrap_or_else(|| config.effective_api_region())
+    }
+
+    /// 从真实 CodeWhisperer profile ARN 中提取 region。
+    ///
+    /// BuilderID 占位符不代表账号实际归属区域，不能参与 API region 推断。
+    fn profile_arn_region(&self) -> Option<&str> {
+        self.effective_profile_arn().and_then(|arn| {
+            let mut parts = arn.split(':');
+            match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                (Some("arn"), Some(_partition), Some("codewhisperer"), Some(region))
+                    if !region.is_empty() =>
+                {
+                    Some(region)
+                }
+                _ => None,
+            }
+        })
     }
 
     /// 获取有效的代理配置
@@ -1507,6 +1529,44 @@ mod tests {
         let creds = KiroCredentials::default();
 
         assert_eq!(creds.effective_api_region(&config), "config-region");
+    }
+
+    #[test]
+    fn test_effective_api_region_fallback_to_profile_arn_region() {
+        let mut config = Config::default();
+        config.region = "us-east-1".to_string();
+
+        let mut creds = KiroCredentials::default();
+        creds.auth_method = Some("idc".to_string());
+        creds.provider = Some("Enterprise".to_string());
+        creds.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/PROFILE".to_string());
+
+        assert_eq!(creds.effective_api_region(&config), "eu-central-1");
+    }
+
+    #[test]
+    fn test_effective_api_region_explicit_config_overrides_profile_arn() {
+        let mut config = Config::default();
+        config.region = "us-east-1".to_string();
+        config.api_region = Some("ap-southeast-1".to_string());
+
+        let mut creds = KiroCredentials::default();
+        creds.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:123456789012:profile/PROFILE".to_string());
+
+        assert_eq!(creds.effective_api_region(&config), "ap-southeast-1");
+    }
+
+    #[test]
+    fn test_effective_api_region_ignores_placeholder_profile_arn() {
+        let mut config = Config::default();
+        config.region = "ap-northeast-1".to_string();
+
+        let mut creds = KiroCredentials::default();
+        creds.profile_arn = Some(BUILDER_ID_PROFILE_ARN.to_string());
+
+        assert_eq!(creds.effective_api_region(&config), "ap-northeast-1");
     }
 
     #[test]

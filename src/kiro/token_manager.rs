@@ -4965,6 +4965,26 @@ mod tests {
     }
 
     #[test]
+    fn test_enterprise_api_call_uses_resolved_profile_region() {
+        let config = Config::default(); // 默认 region = us-east-1
+
+        let credentials = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            provider: Some("Enterprise".to_string()),
+            auth_region: Some("eu-central-1".to_string()),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:eu-central-1:123456789012:profile/PROFILE".to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let api_region = credentials.effective_api_region(&config);
+        let api_host = format!("q.{}.amazonaws.com", api_region);
+
+        assert_eq!(api_host, "q.eu-central-1.amazonaws.com");
+    }
+
+    #[test]
     fn test_api_call_uses_credential_api_region() {
         // 凭据配置了 api_region 时，API 调用应使用凭据的 api_region
         let mut config = Config::default();

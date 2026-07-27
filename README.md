@@ -693,7 +693,7 @@ credential.authRegion -> credential.region -> config.authRegion -> config.region
 API 请求：
 
 ```text
-credential.apiRegion -> config.apiRegion -> config.region
+credential.apiRegion -> config.apiRegion -> resolved profileArn region -> config.region
 ```
 
 部分 REST / 管理类上游接口只在 `us-east-1` 和 `eu-central-1` 提供服务，代码会按账号区域选择候选端点并在必要时回退。
