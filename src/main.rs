@@ -403,6 +403,7 @@ async fn main() {
     tracing::info!("  POST /v1/chat/completions");
     tracing::info!("  POST /v1/responses");
     tracing::info!("Admin API:");
+    tracing::info!("  GET  /api/admin/accounts/usage");
     tracing::info!("  GET  /api/admin/credentials");
     tracing::info!("  POST /api/admin/credentials/:index/disabled");
     tracing::info!("  POST /api/admin/credentials/:index/priority");

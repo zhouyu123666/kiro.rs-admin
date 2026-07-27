@@ -245,6 +245,7 @@ curl http://127.0.0.1:8990/v1/messages/count_tokens \
 | 路径 | 说明 |
 |---|---|
 | `/admin` | 嵌入式 Web 管理界面 |
+| `/api/admin/accounts/usage` | 查询所有 Kiro 账号的最近用量快照 |
 | `/api/admin/credentials` | 凭据列表、新增、编辑、删除 |
 | `/api/admin/credentials/{id}/balance` | 查询单个凭据订阅 / 用量 |
 | `/api/admin/credentials/{id}/models` | 查询该凭据上游实际可用模型 |

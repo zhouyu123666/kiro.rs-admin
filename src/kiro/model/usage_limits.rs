@@ -36,12 +36,20 @@ pub struct UserInfo {
     /// 账号邮箱
     #[serde(default)]
     pub email: Option<String>,
+
+    /// Kiro 上游用户 ID
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 /// 订阅信息
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionInfo {
+    /// 订阅类型 (FREE / PRO / POWER 等)
+    #[serde(default)]
+    pub subscription_type: Option<String>,
+
     /// 订阅标题 (KIRO PRO+ / KIRO FREE 等)
     #[serde(default)]
     pub subscription_title: Option<String>,
@@ -184,6 +192,22 @@ impl UsageLimitsResponse {
             .filter(|s| !s.is_empty())
     }
 
+    /// 获取 Kiro 上游用户 ID
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_info
+            .as_ref()
+            .and_then(|info| info.user_id.as_deref())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// 获取订阅类型
+    pub fn subscription_type(&self) -> Option<&str> {
+        self.subscription_info
+            .as_ref()
+            .and_then(|info| info.subscription_type.as_deref())
+            .filter(|s| !s.is_empty())
+    }
+
     /// 用户当前是否开启了超额（兼容 overageEnabled / overageStatus）
     pub fn overage_enabled(&self) -> Option<bool> {
         let cfg = self.overage_configuration.as_ref()?;
@@ -287,6 +311,19 @@ mod tests {
         let resp: UsageLimitsResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.subscription_title(), Some("KIRO PRO+"));
         assert_eq!(resp.email(), Some("alice@example.com"));
+        assert_eq!(resp.user_id(), Some("u-123"));
+    }
+
+    #[test]
+    fn test_parse_subscription_type() {
+        let json = r#"{
+            "subscriptionInfo": {
+                "subscriptionType": "POWER",
+                "subscriptionTitle": "KIRO POWER"
+            }
+        }"#;
+        let resp: UsageLimitsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.subscription_type(), Some("POWER"));
     }
 
     #[test]

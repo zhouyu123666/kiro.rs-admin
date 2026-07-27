@@ -377,6 +377,12 @@ pub struct BalanceResponse {
     pub id: u64,
     /// 订阅类型
     pub subscription_title: Option<String>,
+    /// 订阅类型标识 (FREE / PRO / POWER 等)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_type: Option<String>,
+    /// Kiro 上游用户 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     /// 当前使用量
     pub current_usage: f64,
     /// 使用限额
@@ -396,6 +402,36 @@ pub struct BalanceResponse {
     /// 上游 `overageCapability` 原始字符串（用于排查"未知"状态）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overage_capability_raw: Option<String>,
+}
+
+/// 所有 Kiro 账号的用量响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsUsageResponse {
+    pub accounts: Vec<AccountUsageItem>,
+}
+
+/// 单个 Kiro 账号的用量摘要
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUsageItem {
+    /// Admin 凭据 ID（使用字符串以兼容账号管理工具的 UUID 字段）
+    pub id: String,
+    pub email: Option<String>,
+    pub user_id: Option<String>,
+    pub enabled: bool,
+    pub subscription_type: Option<String>,
+    pub subscription_title: Option<String>,
+    pub usage_current: f64,
+    pub usage_limit: f64,
+    /// 0..1 比例；超额时可大于 1
+    pub usage_percent: f64,
+    /// 0..100 百分比；超额时可大于 100
+    pub usage_percentage: f64,
+    /// UTC 日期，格式 YYYY-MM-DD
+    pub next_reset_date: Option<String>,
+    /// 余额最后刷新时间（Unix 秒）
+    pub last_refresh: i64,
 }
 
 // ============ 可用模型查询 ============
@@ -1265,6 +1301,38 @@ pub struct ReplaceModelMappingsRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accounts_usage_response_matches_public_contract() {
+        let response = AccountsUsageResponse {
+            accounts: vec![AccountUsageItem {
+                id: "1".to_string(),
+                email: Some("amy.joke@ever5d.com".to_string()),
+                user_id: Some("d-90667167fc.user-1".to_string()),
+                enabled: true,
+                subscription_type: Some("POWER".to_string()),
+                subscription_title: Some("KIRO POWER".to_string()),
+                usage_current: 10_000.0,
+                usage_limit: 10_000.0,
+                usage_percent: 1.0,
+                usage_percentage: 100.0,
+                next_reset_date: Some("2026-08-01".to_string()),
+                last_refresh: 1_785_134_326,
+            }],
+        };
+
+        let json = serde_json::to_value(response).unwrap();
+        let account = &json["accounts"][0];
+        assert_eq!(account["id"], "1");
+        assert_eq!(account["userId"], "d-90667167fc.user-1");
+        assert_eq!(account["subscriptionType"], "POWER");
+        assert_eq!(account["usageCurrent"], 10_000.0);
+        assert_eq!(account["usagePercent"], 1.0);
+        assert_eq!(account["usagePercentage"], 100.0);
+        assert_eq!(account["nextResetDate"], "2026-08-01");
+        assert_eq!(account["lastRefresh"], 1_785_134_326_i64);
+        assert!(account.get("usage_current").is_none());
+    }
 
     /// 回归：Kiro Hosted / IdC 登录成功后前端读 `credentialId`/`nextUrl`（camelCase）。
     /// enum 上仅 `rename_all` 不会重命名 struct variant 内部字段——必须叠加

@@ -25,19 +25,20 @@ use crate::model::config::{Config, RetryMode};
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
-    AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
-    BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CompleteSocialLoginRequest,
-    CredentialResponseTestResponse, CredentialStatusItem, CredentialsExportResponse,
-    CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
-    GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
-    LogGovernanceConfigResponse, PollIdcLoginResponse, ProxyBalancingModeResponse,
-    ProxyCheckAllResponse, ProxyCheckResponse, ProxyCheckUrlRequest, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, RetryPolicyResponse, SetAccountThrottleConfigRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest,
-    SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
-    StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
-    UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    AccountThrottleConfigResponse, AccountUsageItem, AccountsUsageResponse, AddCredentialRequest,
+    AddCredentialResponse, AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem,
+    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
+    CheckRateLimitRequest, CompleteSocialLoginRequest, CredentialResponseTestResponse,
+    CredentialStatusItem, CredentialsExportResponse, CredentialsStatusResponse,
+    EnableOverageAllResult, ExportedAccount, ExportedCredentials, GitHubRateLimitInfo,
+    ImageUpdateResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
+    PollIdcLoginResponse, ProxyBalancingModeResponse, ProxyCheckAllResponse, ProxyCheckResponse,
+    ProxyCheckUrlRequest, ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult,
+    RetryPolicyResponse, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
+    SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
+    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
+    StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
+    UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -647,6 +648,50 @@ impl AdminService {
         }
     }
 
+    /// 获取所有 Kiro 账号的最近用量快照。
+    ///
+    /// 余额由后台调度器每 5 分钟刷新。未完成首次刷新的账号仍会返回，
+    /// 其用量为 0、`lastRefresh` 为 0，便于调用方区分“无数据”和“零用量”。
+    pub fn get_accounts_usage(&self) -> AccountsUsageResponse {
+        let mut entries = self.token_manager.snapshot().entries;
+        entries.sort_by_key(|entry| entry.priority);
+
+        let cache = self.balance_cache.lock();
+        let accounts = entries
+            .into_iter()
+            .map(|entry| {
+                let cached = cache.get(&entry.id);
+                let balance = cached.map(|cached| &cached.data);
+                let usage_percentage = balance.map(|b| b.usage_percentage).unwrap_or(0.0);
+
+                AccountUsageItem {
+                    id: entry.id.to_string(),
+                    email: entry.email,
+                    user_id: balance.and_then(|b| b.user_id.clone()),
+                    enabled: !entry.disabled,
+                    subscription_type: balance.and_then(|b| b.subscription_type.clone()).or_else(
+                        || {
+                            balance
+                                .and_then(|b| b.subscription_title.as_deref())
+                                .and_then(subscription_type_for_usage)
+                        },
+                    ),
+                    subscription_title: balance.and_then(|b| b.subscription_title.clone()),
+                    usage_current: balance.map(|b| b.current_usage).unwrap_or(0.0),
+                    usage_limit: balance.map(|b| b.usage_limit).unwrap_or(0.0),
+                    usage_percent: usage_percentage / 100.0,
+                    usage_percentage,
+                    next_reset_date: balance
+                        .and_then(|b| b.next_reset_at)
+                        .and_then(unix_timestamp_to_utc_date),
+                    last_refresh: cached.map(|cached| cached.cached_at as i64).unwrap_or(0),
+                }
+            })
+            .collect();
+
+        AccountsUsageResponse { accounts }
+    }
+
     /// 导出凭据为兼容 JSON（嵌套 `Account` 格式）
     ///
     /// 返回的结构体含 refreshToken、accessToken、clientSecret 等敏感字段，
@@ -829,6 +874,8 @@ impl AdminService {
         Ok(BalanceResponse {
             id,
             subscription_title: usage.subscription_title().map(|s| s.to_string()),
+            subscription_type: usage.subscription_type().map(|s| s.to_string()),
+            user_id: usage.user_id().map(|s| s.to_string()),
             current_usage,
             usage_limit,
             remaining,
@@ -3548,6 +3595,24 @@ fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
         })
 }
 
+/// 上游旧响应不含 subscriptionType 时，从 `KIRO POWER` 这类标题推导。
+fn subscription_type_for_usage(title: &str) -> Option<String> {
+    let normalized = title.trim().to_uppercase();
+    let value = normalized
+        .strip_prefix("KIRO ")
+        .unwrap_or(normalized.as_str())
+        .trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn unix_timestamp_to_utc_date(timestamp: f64) -> Option<String> {
+    if !timestamp.is_finite() {
+        return None;
+    }
+    DateTime::<Utc>::from_timestamp(timestamp as i64, 0)
+        .map(|date_time| date_time.format("%Y-%m-%d").to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3644,5 +3709,27 @@ mod tests {
             "Enterprise"
         );
         assert_eq!(subscription_type_from_title(None), "Free");
+    }
+
+    #[test]
+    fn usage_subscription_type_falls_back_to_title() {
+        assert_eq!(
+            subscription_type_for_usage("KIRO POWER").as_deref(),
+            Some("POWER")
+        );
+        assert_eq!(
+            subscription_type_for_usage("kiro pro+").as_deref(),
+            Some("PRO+")
+        );
+        assert_eq!(subscription_type_for_usage("  "), None);
+    }
+
+    #[test]
+    fn usage_reset_timestamp_is_formatted_as_utc_date() {
+        assert_eq!(
+            unix_timestamp_to_utc_date(1_785_542_400.0).as_deref(),
+            Some("2026-08-01")
+        );
+        assert_eq!(unix_timestamp_to_utc_date(f64::NAN), None);
     }
 }

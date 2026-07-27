@@ -43,6 +43,12 @@ pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoRe
     Json(response)
 }
 
+/// GET /api/admin/accounts/usage
+/// 获取所有 Kiro 账号的最近用量快照
+pub async fn get_accounts_usage(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_accounts_usage())
+}
+
 /// GET /api/admin/credentials/export
 /// 导出凭据为兼容 JSON（含 refreshToken 等敏感字段）
 ///
