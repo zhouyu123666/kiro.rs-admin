@@ -315,9 +315,7 @@ pub fn map_model(model: &str) -> Option<String> {
         // Fable 5：与 Mythos 5 同底座；目前仅 5 代
         Some("claude-fable-5".to_string())
     } else if model_lower.contains("sonnet") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-sonnet-4.8".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
+        if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
@@ -341,6 +339,12 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-opus-4.5".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-opus-4.6".to_string())
+        } else if model_lower.contains("opus-5")
+            || model_lower.contains("opus5")
+            || model_lower.contains("opus.5")
+        {
+            // 精确匹配 5 代，避免命中 legacy 名字里的其它数字
+            Some("claude-opus-5".to_string())
         } else {
             None
         }
@@ -360,13 +364,14 @@ pub fn normalize_model_id(model: &str) -> String {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 / 4.8 同 1M
+/// 4.7 / 4.8 / 5 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
     let mapped = normalize_model_id(model);
     let model_lower = mapped.to_ascii_lowercase();
     match mapped.as_str() {
-        "claude-sonnet-4.6" | "claude-sonnet-4.8" | "claude-sonnet-5" | "claude-opus-4.6"
-        | "claude-opus-4.7" | "claude-opus-4.8" | "claude-fable-5" | "auto" => 1_000_000,
+        "claude-sonnet-4.6" | "claude-sonnet-5" | "claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8" | "claude-opus-5" | "claude-fable-5" | "auto" => {
+            1_000_000
+        }
         "deepseek-3.2" => 164_000,
         "minimax-m2.5" | "minimax-m2.1" => 196_000,
         "qwen3-coder-next" => 256_000,
@@ -1972,19 +1977,6 @@ mod tests {
     }
 
     #[test]
-    fn test_map_model_sonnet_4_8() {
-        assert_eq!(
-            map_model("claude-sonnet-4-8"),
-            Some("claude-sonnet-4.8".to_string())
-        );
-        assert_eq!(
-            map_model("claude-sonnet-4.8-thinking"),
-            Some("claude-sonnet-4.8".to_string())
-        );
-        assert_eq!(get_context_window_size("claude-sonnet-4-8"), 1_000_000);
-    }
-
-    #[test]
     fn test_map_model_future_claude_versions_normalize_without_static_entries() {
         assert_eq!(
             map_model("claude-opus-4-9-thinking"),
@@ -2016,6 +2008,24 @@ mod tests {
         assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
         // 不应误判 legacy claude-3-5-sonnet
         assert_eq!(map_model("claude-3-5-sonnet-20241022"), None);
+    }
+
+    #[test]
+    fn test_map_model_opus_5() {
+        assert_eq!(
+            map_model("claude-opus-5"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-thinking"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+        // 不应影响 4.x 分支
+        assert_eq!(
+            map_model("claude-opus-4-5-20251101"),
+            Some("claude-opus-4.5".to_string())
+        );
     }
 
     #[test]
@@ -2397,6 +2407,7 @@ mod tests {
             "claude-opus-4.6",
             "claude-opus-4.7",
             "claude-opus-4.8",
+            "claude-opus-5",
             "claude-sonnet-4.6",
             "claude-fable-5",
             "claude-sonnet-5",
@@ -2407,7 +2418,6 @@ mod tests {
             );
         }
         for m in [
-            "claude-sonnet-4.8",
             "claude-sonnet-4.5",
             "claude-opus-4.5",
             "claude-haiku-4.5",
