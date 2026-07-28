@@ -9,3 +9,9 @@ services:
     volumes:
       - ./data/:/app/config/
     restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.10.0.0/24
