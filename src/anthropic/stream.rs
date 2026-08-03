@@ -9,19 +9,6 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
 
-/// thinking 块的 signature 占位字符串
-///
-/// Anthropic Messages API 协议规定 thinking 模式下，assistant 消息的
-/// `{type:"thinking", ...}` 块必须带 `signature` 字段并在下一轮原样回传，
-/// 否则 SDK / 服务端会拒绝请求并报：
-/// `The content[].thinking in the thinking mode must be passed back to the API`。
-///
-/// 上游 Kiro 不下发真实签名（它本身不是 Anthropic 服务端），因此 kiro.rs 在
-/// thinking 块结束时插入一个非空占位字符串以满足客户端本地校验。
-/// converter 在解析 assistant 消息回传 Kiro 时只读 `block.thinking`，不读
-/// signature，因此该占位字符串只在客户端 ↔ kiro.rs 之间存在，不会影响转发。
-pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
-
 const TOOL_USE_XML_PREFIX: &str = "<tool_use";
 const TOOL_USE_XML_CLOSE: &str = "</tool_use>";
 
@@ -711,10 +698,39 @@ fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
     0
 }
 
+/// 查找**最后一个**满足 [`find_real_thinking_end_tag`] 条件的结束标签。
+///
+/// 上游在 thinking 结束后不会再产生结束标签，因此整段文本里最后一个满足条件的
+/// 候选才是真实边界；取第一个会在 thinking 内部裸提及 `</thinking>` 且其后恰好
+/// 跟 `\n\n` 时于提及处截断，把剩余 thinking 连同一个字面标签漏进正文。
+///
+/// 仅用于非流式路径——那里整段文本已完整。流式路径无法采用“最后一个”语义：
+/// 收到第一个候选时还不知道后面是否有第二个，要判定就必须缓冲到流结束，
+/// 那会牺牲 thinking 的增量输出。
+fn find_last_real_thinking_end_tag(buffer: &str) -> Option<usize> {
+    let mut last = None;
+    let mut search_from = 0;
+
+    while let Some(rel) = find_real_thinking_end_tag(&buffer[search_from..]) {
+        let absolute = search_from + rel;
+        last = Some(absolute);
+        search_from = absolute + "</thinking>".len();
+        if search_from >= buffer.len() {
+            break;
+        }
+    }
+
+    last
+}
+
 /// 从完整文本中提取 thinking 块（用于非流式响应）
 ///
 /// 使用与流式处理相同的标签检测逻辑（引用字符过滤），确保一致性。
 /// 非流式场景下文本已完整，无需处理跨 chunk 分割问题。
+///
+/// 结束标签取**最后一个**满足条件的候选（见 [`find_last_real_thinking_end_tag`]），
+/// 因此 thinking 内部裸提及 `</thinking>` 不会导致截断。这与流式路径存在细微差异：
+/// 流式只能取第一个满足条件的候选。
 ///
 /// # 返回值
 /// - `(Some(thinking_content), remaining_text)` — 检测到有效 thinking 块
@@ -728,19 +744,20 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     let before = &text[..start_pos];
     let after_open = &text[start_pos + "<thinking>".len()..];
 
-    // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-        (
-            &after_open[..end_pos],
-            &after_open[end_pos + "</thinking>\n\n".len()..],
-        )
-    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-        let after_tag = end_pos + "</thinking>".len();
-        (&after_open[..end_pos], after_open[after_tag..].trim_start())
-    } else {
-        // 找不到有效的结束标签，不做提取
-        return (None, text.to_string());
-    };
+    // 查找结束标签：优先匹配带 \n\n 后缀的（取最后一个），退而使用末尾匹配
+    let (thinking_raw, text_after) =
+        if let Some(end_pos) = find_last_real_thinking_end_tag(after_open) {
+            (
+                &after_open[..end_pos],
+                &after_open[end_pos + "</thinking>\n\n".len()..],
+            )
+        } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
+            let after_tag = end_pos + "</thinking>".len();
+            (&after_open[..end_pos], after_open[after_tag..].trim_start())
+        } else {
+            // 找不到有效的结束标签，不做提取
+            return (None, text.to_string());
+        };
 
     // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
     let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
@@ -1729,8 +1746,6 @@ impl StreamContext {
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // signature_delta：满足客户端 thinking 模式下的本地校验
-                        events.push(self.create_signature_delta_event(thinking_index));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -2118,14 +2133,12 @@ impl StreamContext {
             return Vec::new();
         }
 
-        let signature = self
-            .pending_thinking_signature
-            .take()
-            .unwrap_or_else(|| THINKING_SIGNATURE_PLACEHOLDER.to_string());
-        let mut events = vec![
-            self.create_thinking_delta_event(idx, ""),
-            self.create_signature_delta_event_with(idx, &signature),
-        ];
+        let mut events = vec![self.create_thinking_delta_event(idx, "")];
+        // signature 只能来自 Kiro 原生 reasoningContentEvent。上游没有给出时
+        // 省略 signature_delta，不伪造可能被下游误当成 Anthropic 签名的值。
+        if let Some(signature) = self.pending_thinking_signature.take() {
+            events.push(self.create_signature_delta_event_with(idx, &signature));
+        }
         if let Some(stop_event) = self.state_manager.handle_content_block_stop(idx) {
             events.push(stop_event);
         }
@@ -2215,20 +2228,7 @@ impl StreamContext {
         )
     }
 
-    /// 创建 signature_delta 事件
-    ///
-    /// Anthropic 协议下 thinking 块流式结束前必须发一个 signature_delta，
-    /// SDK 会把它聚合到 thinking 块的 `signature` 字段。客户端在下一轮把
-    /// assistant 消息回传时本地校验 thinking 块必须带非空 signature，否则抛出
-    /// `The content[].thinking in the thinking mode must be passed back to the API`。
-    ///
-    /// 上游 Kiro 不是 Anthropic 服务端，不会下发真实签名，因此这里发一个非空
-    /// 占位字符串以满足客户端本地校验。该字段不参与转发回 Kiro 的逻辑
-    /// （converter 只读 `block.thinking`，不读 signature）。
-    fn create_signature_delta_event(&self, index: i32) -> SseEvent {
-        self.create_signature_delta_event_with(index, THINKING_SIGNATURE_PLACEHOLDER)
-    }
-
+    /// 透传 Kiro 原生 reasoningContentEvent 中的 signature。
     fn create_signature_delta_event_with(&self, index: i32, signature: &str) -> SseEvent {
         SseEvent::new(
             "content_block_delta",
@@ -2335,8 +2335,6 @@ impl StreamContext {
                 if let Some(thinking_index) = self.thinking_block_index {
                     // 先发送空的 thinking_delta
                     events.push(self.create_thinking_delta_event(thinking_index, ""));
-                    // signature_delta：满足客户端 thinking 模式下的本地校验
-                    events.push(self.create_signature_delta_event(thinking_index));
                     // 再发送 content_block_stop
                     if let Some(stop_event) =
                         self.state_manager.handle_content_block_stop(thinking_index)
@@ -2427,8 +2425,6 @@ impl StreamContext {
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // signature_delta：满足客户端 thinking 模式下的本地校验
-                        events.push(self.create_signature_delta_event(thinking_index));
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
                         {
@@ -2456,8 +2452,6 @@ impl StreamContext {
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // signature_delta：满足客户端 thinking 模式下的本地校验
-                        events.push(self.create_signature_delta_event(thinking_index));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -3367,6 +3361,43 @@ mod tests {
     }
 
     #[test]
+    fn test_non_stream_bare_mention_before_real_boundary_does_not_truncate() {
+        // thinking 内部裸提及 `</thinking>` 且其后恰好跟 `\n\n`，真实边界在更后面。
+        // 取第一个候选会在提及处截断；取最后一个才能还原完整 thinking 与干净正文。
+        let text = "<thinking>I should not emit </thinking>\n\nreal thinking continues</thinking>\n\nanswer";
+        let (thinking, remaining) = extract_thinking_from_complete_text(text);
+
+        assert_eq!(
+            thinking.as_deref(),
+            Some("I should not emit </thinking>\n\nreal thinking continues"),
+            "thinking 应完整保留，含内部的裸提及"
+        );
+        assert_eq!(remaining, "answer", "正文不应残留字面 </thinking>");
+        assert!(
+            !remaining.contains("</thinking>"),
+            "正文不得漏出结束标签: {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn test_find_last_real_thinking_end_tag_picks_final_candidate() {
+        // 单个候选：与 find_real_thinking_end_tag 行为一致
+        assert_eq!(
+            find_last_real_thinking_end_tag("abc</thinking>\n\n"),
+            Some(3)
+        );
+        // 多个候选：取最后一个（"a" + "</thinking>" + "\n\n" + "b" = 15）
+        assert_eq!(
+            find_last_real_thinking_end_tag("a</thinking>\n\nb</thinking>\n\n"),
+            Some(15)
+        );
+        // 无候选
+        assert_eq!(find_last_real_thinking_end_tag("no tag here"), None);
+        // 被引号包裹的不算候选
+        assert_eq!(find_last_real_thinking_end_tag("`</thinking>`\n\n"), None);
+    }
+
+    #[test]
     fn test_find_real_thinking_end_tag_mixed() {
         // 先有被包裹的，后有真正的结束标签
         assert_eq!(
@@ -3448,10 +3479,8 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_block_emits_signature_delta_before_stop() {
-        // 客户端在 thinking 模式下要求 thinking 块带 signature 字段，否则下一轮回传时
-        // 会抛出 "must be passed back to the API"。本测试验证 thinking 块结束前发送了
-        // 一个非空的 signature_delta 事件。
+    fn test_legacy_thinking_block_does_not_fabricate_signature() {
+        // 旧的带内 <thinking> 路径没有可验证的上游签名，不得伪造 signature_delta。
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -3465,29 +3494,10 @@ mod tests {
         all.extend(ctx.process_assistant_response("<thinking>abc</thinking>\n\nhello"));
         all.extend(ctx.generate_final_events());
 
-        let thinking_index = ctx
-            .thinking_block_index
-            .expect("thinking block index should exist");
-
-        let pos_sig = all.iter().position(|e| {
-            e.event == "content_block_delta"
-                && e.data["index"].as_i64() == Some(thinking_index as i64)
-                && e.data["delta"]["type"] == "signature_delta"
-                && e.data["delta"]["signature"]
-                    .as_str()
-                    .is_some_and(|s| !s.is_empty())
-        });
-        let pos_stop = all.iter().position(|e| {
-            e.event == "content_block_stop"
-                && e.data["index"].as_i64() == Some(thinking_index as i64)
-        });
-
-        assert!(pos_sig.is_some(), "signature_delta should be emitted");
-        assert!(pos_stop.is_some(), "content_block_stop should be emitted");
-        assert!(
-            pos_sig.unwrap() < pos_stop.unwrap(),
-            "signature_delta must precede content_block_stop"
-        );
+        assert!(ctx.thinking_block_index.is_some());
+        assert!(!all.iter().any(|e| {
+            e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
+        }));
     }
 
     #[test]
@@ -5086,6 +5096,37 @@ mod tests {
             e.event == "content_block_delta"
                 && e.data["delta"]["type"] == "signature_delta"
                 && e.data["delta"]["signature"] == "signature-before-text"
+        }));
+    }
+
+    #[test]
+    fn test_unsigned_native_reasoning_omits_signature_delta() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut all_events = ctx.generate_initial_events();
+
+        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("unsigned native reasoning".to_string()),
+                signature: None,
+                redacted_content: None,
+            },
+        )));
+        all_events.extend(ctx.process_assistant_response("final answer"));
+        all_events.extend(ctx.generate_final_events());
+
+        assert_eq!(
+            collect_thinking_content(&all_events),
+            "unsigned native reasoning"
+        );
+        assert_eq!(collect_text_content(&all_events), "final answer");
+        assert!(!all_events.iter().any(|e| {
+            e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
         }));
     }
 

@@ -559,11 +559,44 @@ Adaptive thinking：
 Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转换为 Anthropic 兼容内容：
 
 - `text` → 流式 `thinking_delta`，非流式 `thinking` block。
-- `signature` → 流式 `signature_delta`，非流式 `thinking.signature`。
+- 非空 `signature` → 流式 `signature_delta`，非流式 `thinking.signature`；值会原样透传。
+- 上游没有提供 `signature` 时省略该字段，不伪造 Anthropic thinking 签名。
 - `redactedContent` → `redacted_thinking` block。
 - 如果当前请求没有启用 thinking，明文 reasoning 会降级为普通 text；签名和 redacted 内容不会输出。
 
 非流式响应优先使用原生 reasoning 事件；只有没有原生 reasoning 时，才回退到旧的 `<thinking>...</thinking>` 文本提取路径。
+
+回退路径下 thinking 与正文的边界靠带内标签判定，两条路径的语义有已知差异：
+
+- **非流式**取**最后一个**满足条件（未被引号包裹、后跟 `\n\n`）的 `</thinking>`。
+  上游在 thinking 结束后不会再产生结束标签，所以最后一个候选才是真实边界。
+  因此 thinking 内部裸提及 `</thinking>` 不会导致截断。
+- **流式**只能取**第一个**满足条件的候选。收到第一个候选时无法预知后面是否还有第二个，
+  要判定就必须缓冲到流结束，那会牺牲 thinking 的增量输出。
+  所以流式下若 thinking 内部出现裸的 `</thinking>` 且其后恰好跟 `\n\n`，
+  仍会在该提及处提前切分，剩余 thinking 连同一个字面标签进入正文。
+
+上游下发原生 `reasoningContentEvent` 时两条路径都不做带内边界解析，不受此差异影响。
+
+Kiro 历史消息只支持单一的 `content` 字符串，因此回放历史 assistant 消息时仍需要使用
+`<thinking>...</thinking>` 带内边界。为避免内容中的字面标签与边界冲突，载荷按以下可逆约定编码。
+
+编码（从左到右单次扫描，规则互不重入）：
+
+1. 字面 `<thinking>` 编码为 `&lt;thinking&gt;`。
+2. 字面 `</thinking>` 编码为 `&lt;/thinking&gt;`。
+3. `&` **仅当**它是 `&lt;thinking&gt;`、`&lt;/thinking&gt;` 或 `&amp;` 的起始时，编码为 `&amp;`。
+   其余 `&` 原样保留。
+
+解码时按逆序执行：先还原两种 thinking 标签实体，最后将 `&amp;` 还原为 `&`。
+
+规则 3 是可逆性的必要条件——否则输入里字面的 `&lt;thinking&gt;` 会与规则 1 的编码结果混淆。
+但它被收窄到只针对这三种歧义前缀，因此 `a && b`、`?x=1&y=2`、`R&D` 这类普通内容不受影响，
+对不含歧义序列的文本编码是幂等的（不会跨轮累积转义层）。
+
+该编码无条件应用于所有 assistant 载荷，与消息里是否存在 thinking block 无关，
+因此解码方无需先判断消息形状。编码后的载荷中出现的 `<thinking>` / `</thinking>`
+只可能是 kiro.rs 添加的那一对真实边界。
 
 ### Tool Use
 

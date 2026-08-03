@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### 🔧 修复 — Thinking 签名与边界一致性
+
+- 不再为无签名的 thinking 块注入 `kiro-rs-thinking-signature`；只有 Kiro 原生 `reasoningContentEvent` 提供非空签名时才原样透传。
+- 流式与非流式路径使用相同策略：有 genuine 上游签名则输出，否则省略 `signature` / `signature_delta`。
+- 对回放到 Kiro 单字符串历史中的 thinking 和 answer 载荷做可逆编码，防止字面 `<thinking>` / `</thinking>` 与真实边界混淆。
+- 编码只在 `&` 构成 `&lt;thinking&gt;` / `&lt;/thinking&gt;` / `&amp;` 歧义前缀时才转义它，普通 `&`（`a && b`、`?x=1&y=2`、`R&D`）原样保留；对普通文本编码幂等，不再跨轮累积转义层。
+- 编码无条件应用于所有 assistant 载荷，不再依赖消息中是否存在 thinking block，避免解码约定随消息形状变化。
+- 非流式 legacy 带内路径改取**最后一个**满足条件的 `</thinking>`，修复 thinking 内部裸提及该标签且其后跟 `\n\n` 时 thinking 被截断、剩余内容连同字面标签漏进正文的问题。流式路径受增量输出约束仍取第一个候选，该差异已在 README 说明。
+- 新增原生有签名、原生无签名、legacy 无签名、普通 `&` 不受影响、编码幂等、歧义序列往返、纯文本消息编码及非流式裸提及不截断的回归测试。
+
 ## [0.6.11] - 2026-07-12
 
 主题：**修复 AWS Enterprise / IAM Identity Center 凭据首次模型调用后，Admin 余额与可用模型查询持续返回 400 的问题**。企业凭据会在首次流式模型请求前通过 `ListAvailableProfiles` 解析真实 `profileArn` 并持久化；旧代码随后将该 ARN 复用到固定使用 Kiro 0.9.2 兼容协议的 `getUsageLimits` 与 `ListAvailableModels` REST GET，导致上游返回 `400 Bad Request {"message":"Improperly formed request."}`。本版隔离流式端点与旧版 REST 端点的 ARN 语义，让企业模型调用和 Admin 查询可以同时正常工作。

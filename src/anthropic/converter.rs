@@ -369,9 +369,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
     let mapped = normalize_model_id(model);
     let model_lower = mapped.to_ascii_lowercase();
     match mapped.as_str() {
-        "claude-sonnet-4.6" | "claude-sonnet-5" | "claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8" | "claude-opus-5" | "claude-fable-5" | "auto" => {
-            1_000_000
-        }
+        "claude-sonnet-4.6" | "claude-sonnet-5" | "claude-opus-4.6" | "claude-opus-4.7"
+        | "claude-opus-4.8" | "claude-opus-5" | "claude-fable-5" | "auto" => 1_000_000,
         "deepseek-3.2" => 164_000,
         "minimax-m2.5" | "minimax-m2.1" => 196_000,
         "qwen3-coder-next" => 256_000,
@@ -1813,6 +1812,75 @@ fn merge_user_messages(
 }
 
 /// 转换 assistant 消息
+///
+/// Kiro 历史协议只有一个 `content` 字符串，thinking 与正文不得不用标签分隔。
+/// 为了不让内容中的字面 `<thinking>` / `</thinking>` 与真实边界冲突，对载荷做
+/// 可逆编码，使编码结果中出现的 `<thinking>` / `</thinking>` 只可能是 kiro.rs
+/// 自己添加的那一对真实边界。
+///
+/// 编码规则（从左到右单次扫描，互不重入）：
+/// 1. 字面 `<thinking>` → `&lt;thinking&gt;`
+/// 2. 字面 `</thinking>` → `&lt;/thinking&gt;`
+/// 3. `&` **仅当**它是 `&lt;thinking&gt;` / `&lt;/thinking&gt;` / `&amp;` 的起始时
+///    → `&amp;`；其余 `&` 原样保留
+///
+/// 规则 3 是可逆性的必要条件：否则输入里字面的 `&lt;thinking&gt;` 会与规则 1 的
+/// 编码结果混淆。但它被收窄到只针对这三种歧义前缀，因此 `a && b`、
+/// `?x=1&y=2`、`R&D` 这类普通内容不受影响——旧实现无条件转义所有 `&`，
+/// 会大面积改写与 thinking 边界无关的正文。
+///
+/// 该编码对普通文本是幂等的：不含上述三种歧义序列的输入编码后不变。
+///
+/// 解码约定见 [`unescape_inband_thinking_content`]。
+fn escape_inband_thinking_content(content: &str) -> String {
+    /// `&` 后面跟这些内容时才需要转义 `&` 本身。
+    const AMBIGUOUS_AFTER_AMP: [&str; 3] = ["lt;thinking&gt;", "lt;/thinking&gt;", "amp;"];
+
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+
+    while !rest.is_empty() {
+        if let Some(tail) = rest.strip_prefix("<thinking>") {
+            out.push_str("&lt;thinking&gt;");
+            rest = tail;
+        } else if let Some(tail) = rest.strip_prefix("</thinking>") {
+            out.push_str("&lt;/thinking&gt;");
+            rest = tail;
+        } else if let Some(after_amp) = rest.strip_prefix('&')
+            && AMBIGUOUS_AFTER_AMP.iter().any(|p| after_amp.starts_with(p))
+        {
+            // 只转义 `&` 本身，后续字符留给下一轮扫描按普通内容处理。
+            out.push_str("&amp;");
+            rest = after_amp;
+        } else {
+            // 普通字符原样透传，按 UTF-8 字符边界推进。
+            let ch = rest.chars().next().unwrap_or_default();
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+
+    out
+}
+
+/// [`escape_inband_thinking_content`] 的逆运算，即 README 中发布的解码约定的
+/// 参考实现。
+///
+/// 解码顺序是编码的逆序：先还原两种标签实体，最后还原 `&amp;`。这个顺序是安全的
+/// ——编码保证输出中任何 `&lt;thinking&gt;` 都只可能来自输入里的字面
+/// `<thinking>`（输入里字面的 `&lt;thinking&gt;` 会因规则 3 把 `&` 转成 `&amp;`
+/// 而破坏该模式），因此“标签优先”不会误伤。
+///
+/// kiro.rs 自身只写不读 Kiro 历史，故生产路径没有调用点；保留此函数是为了让
+/// 已发布的约定有一份可执行、可测试的规范实现。
+#[allow(dead_code)]
+fn unescape_inband_thinking_content(content: &str) -> String {
+    content
+        .replace("&lt;thinking&gt;", "<thinking>")
+        .replace("&lt;/thinking&gt;", "</thinking>")
+        .replace("&amp;", "&")
+}
+
 fn convert_assistant_message(
     msg: &super::types::Message,
     tool_name_map: &mut HashMap<String, String>,
@@ -1861,6 +1929,12 @@ fn convert_assistant_message(
     // 组合 thinking 和 text 内容
     // 格式: <thinking>思考内容</thinking>\n\ntext内容
     // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
+    // 编码无条件应用于所有载荷，与是否存在 thinking block 无关。若只在有 thinking
+    // 时编码，解码约定就会依赖消息形状：纯文本消息里的字面 `<thinking>` 未编码，
+    // 统一按约定解码的下游会误还原 `&amp;`，或把这段文本当成真实边界。
+    let thinking_content = escape_inband_thinking_content(&thinking_content);
+    let text_content = escape_inband_thinking_content(&text_content);
+
     let final_content = if !thinking_content.is_empty() {
         if !text_content.is_empty() {
             format!(
@@ -2417,11 +2491,7 @@ mod tests {
                 "{m} 应支持原生 reasoning"
             );
         }
-        for m in [
-            "claude-sonnet-4.5",
-            "claude-opus-4.5",
-            "claude-haiku-4.5",
-        ] {
+        for m in ["claude-sonnet-4.5", "claude-opus-4.5", "claude-haiku-4.5"] {
             assert!(
                 !model_supports_native_reasoning(m),
                 "{m} 未确认支持，不应下发 output_config"
@@ -3418,6 +3488,125 @@ mod tests {
             .expect("应该有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_02XYZ");
+    }
+
+    #[test]
+    fn inband_escape_leaves_ordinary_ampersands_untouched() {
+        // 与 thinking 边界无关的 `&` 不应被改写：旧实现会把这些全部转成 `&amp;`。
+        for s in [
+            "if (a && b) { return; }",
+            "https://x.com/p?a=1&b=2",
+            "Tom & Jerry",
+            "R&D 团队",
+            "&lt;div&gt; 不是 thinking 标签",
+            "&amp",              // 不完整实体，不构成歧义
+            "& lt;thinking&gt;", // 有空格，不构成歧义
+        ] {
+            assert_eq!(
+                escape_inband_thinking_content(s),
+                s,
+                "普通内容不应被改写: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inband_escape_is_idempotent_for_ordinary_text() {
+        // 普通文本反复编码不应累积层数（旧实现每轮都会把 `&` 变成 `&amp;`）。
+        let s = "code: a && b, url: ?x=1&y=2, R&D";
+        let once = escape_inband_thinking_content(s);
+        let twice = escape_inband_thinking_content(&once);
+        assert_eq!(once, s);
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn inband_escape_roundtrips_ambiguous_and_literal_sequences() {
+        // 三类需要编码的输入 + 混合内容，都必须无损往返。
+        for original in [
+            "literal </thinking> here",
+            "literal <thinking> here",
+            "already-encoded-looking &lt;/thinking&gt;",
+            "already-encoded-looking &lt;thinking&gt;",
+            "escaped amp &amp; here",
+            "mixed </thinking> and &lt;/thinking&gt; and &amp; and plain & and a && b",
+            "嵌套 &amp;lt;thinking&gt; 与真实 <thinking>",
+        ] {
+            let encoded = escape_inband_thinking_content(original);
+            assert_eq!(
+                unescape_inband_thinking_content(&encoded),
+                original,
+                "往返应无损: {original:?}"
+            );
+            // 编码结果中不得残留可被误认为真实边界的裸标签。
+            assert!(
+                !encoded.contains("<thinking>") && !encoded.contains("</thinking>"),
+                "编码后不应有裸标签: {original:?} -> {encoded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_history_text_only_message_is_also_escaped() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 没有 thinking block 的纯文本消息同样要编码，否则解码约定依赖消息形状。
+        let original_text = "I will explain <thinking>foo</thinking>\n\nbar & baz";
+        let msg = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([{"type": "text", "text": original_text}]),
+        };
+
+        let result =
+            convert_assistant_message(&msg, &mut HashMap::new(), ToolCompatibilityMode::Raw)
+                .expect("应该成功转换");
+        let wire = result.assistant_response_message.content;
+
+        assert!(!wire.contains("<thinking>"), "不应有裸开标签: {wire:?}");
+        assert!(!wire.contains("</thinking>"), "不应有裸闭标签: {wire:?}");
+        // 普通 `&` 不受影响。
+        assert!(wire.contains("bar & baz"), "普通 & 不应被改写: {wire:?}");
+        assert_eq!(unescape_inband_thinking_content(&wire), original_text);
+    }
+
+    #[test]
+    fn assistant_history_thinking_delimiters_are_reversibly_escaped() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let original_thinking =
+            "literal </thinking>\n\nplus <thinking> and existing &lt;/thinking&gt;";
+        let original_text = "answer mentions </thinking> & <thinking> too";
+        let msg = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": original_thinking, "signature": "upstream-signature"},
+                {"type": "text", "text": original_text}
+            ]),
+        };
+
+        let result =
+            convert_assistant_message(&msg, &mut HashMap::new(), ToolCompatibilityMode::Raw)
+                .expect("应该成功转换");
+        let wire = result.assistant_response_message.content;
+
+        // 载荷内所有同名标签都已编码，只剩 kiro.rs 添加的一对真实边界。
+        assert_eq!(wire.matches("<thinking>").count(), 1);
+        assert_eq!(wire.matches("</thinking>").count(), 1);
+
+        let encoded = wire
+            .strip_prefix("<thinking>")
+            .expect("应有 thinking 起始边界");
+        let (encoded_thinking, encoded_text) = encoded
+            .split_once("</thinking>\n\n")
+            .expect("应有唯一 thinking 结束边界");
+        assert_eq!(
+            unescape_inband_thinking_content(encoded_thinking),
+            original_thinking
+        );
+        assert_eq!(
+            unescape_inband_thinking_content(encoded_text),
+            original_text
+        );
     }
 
     #[test]

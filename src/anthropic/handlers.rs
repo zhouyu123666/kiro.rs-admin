@@ -1450,12 +1450,14 @@ fn build_non_stream_content(
 
     if thinking_enabled {
         if has_native_thinking {
-            content.push(json!({
+            let mut block = json!({
                 "type": "thinking",
                 "thinking": native_thinking.clone(),
-                "signature": native_thinking_signature
-                    .unwrap_or_else(|| super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()),
-            }));
+            });
+            if let Some(signature) = native_thinking_signature {
+                block["signature"] = serde_json::Value::String(signature);
+            }
+            content.push(block);
         } else {
             // 从完整文本中提取 thinking 块，兼容旧的 <thinking> 文本路径。
             let (thinking, remaining_text) =
@@ -1465,7 +1467,6 @@ fn build_non_stream_content(
                 content.push(json!({
                     "type": "thinking",
                     "thinking": thinking_text,
-                    "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
                 }));
             }
 
@@ -2101,11 +2102,24 @@ mod tests {
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["type"], "thinking");
         assert_eq!(content[0]["thinking"], "legacy thinking");
-        assert_eq!(
-            content[0]["signature"],
-            crate::anthropic::stream::THINKING_SIGNATURE_PLACEHOLDER
-        );
+        assert!(content[0].get("signature").is_none());
         assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "final answer");
+    }
+
+    #[test]
+    fn non_stream_unsigned_native_thinking_omits_signature() {
+        let content = build_non_stream_content(
+            true,
+            "final answer".to_string(),
+            "unsigned native thinking".to_string(),
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "unsigned native thinking");
+        assert!(content[0].get("signature").is_none());
         assert_eq!(content[1]["text"], "final answer");
     }
 
