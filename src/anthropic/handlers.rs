@@ -30,7 +30,9 @@ use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{
+    BufferedStreamContext, SseEvent, StreamContext, UPSTREAM_EMPTY_COMPLETION_MESSAGE,
+};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
     OutputConfig, Thinking,
@@ -1061,7 +1063,7 @@ fn create_sse_stream(
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             // 发送最终事件并结束（记为 error）
-                            let final_events = ctx.generate_final_events();
+                            let final_events = ctx.generate_interrupted_final_events();
                             record_stream_usage(&hook, &ctx, credential_id, "error");
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
                             tracer.finalize(
@@ -1089,6 +1091,15 @@ fn create_sse_stream(
                                     "error",
                                     Some(outcome::BAD_REQUEST),
                                     Some(&message),
+                                    None,
+                                    stream_trace_usage(&ctx),
+                                );
+                            } else if ctx.has_empty_completion_error() {
+                                record_stream_usage(&hook, &ctx, credential_id, "error");
+                                tracer.finalize(
+                                    "error",
+                                    Some(outcome::EMPTY_RESPONSE),
+                                    Some(UPSTREAM_EMPTY_COMPLETION_MESSAGE),
                                     None,
                                     stream_trace_usage(&ctx),
                                 );
@@ -1281,6 +1292,27 @@ async fn handle_non_stream_request(
                                 native_redacted_thinking.push(redacted);
                             }
                         }
+                        Event::Metadata(metadata) => {
+                            if metadata.is_content_filtered() {
+                                stop_reason = "refusal".to_string();
+                                if text_content.trim().is_empty() {
+                                    text_content.push_str(
+                                        metadata
+                                            .refusal_explanation()
+                                            .unwrap_or(super::stream::UPSTREAM_REFUSAL_MESSAGE),
+                                    );
+                                }
+                                tracing::warn!(
+                                    category = ?metadata.refusal_category(),
+                                    "上游模型因内容策略拒绝响应"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    stop_reason = ?metadata.stop_reason,
+                                    "收到 Kiro metadataEvent"
+                                );
+                            }
+                        }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
                             match tool_accumulator.push(&tool_use, &tool_name_map) {
@@ -1315,7 +1347,27 @@ async fn handle_non_stream_request(
                                 stop_reason = "max_tokens".to_string();
                             }
                         }
-                        _ => {}
+                        Event::Error {
+                            error_code,
+                            error_message,
+                        } => {
+                            tracing::warn!(
+                                error_code = %error_code,
+                                error_message = %error_message,
+                                "收到上游错误事件"
+                            );
+                        }
+                        Event::Unknown {
+                            event_type,
+                            payload,
+                        } => {
+                            // 仅 trace 级输出原始 payload，用于诊断上游新增事件类型。
+                            tracing::trace!(
+                                event_type = %event_type,
+                                payload = %String::from_utf8_lossy(&payload),
+                                "收到未知 Kiro 事件"
+                            );
+                        }
                     }
                 }
             }
@@ -1370,6 +1422,50 @@ async fn handle_non_stream_request(
         native_redacted_thinking,
     );
     content.extend(tool_uses);
+
+    if content.is_empty() && stop_reason == "end_turn" {
+        tracing::warn!("上游响应正常结束，但没有产生任何 assistant 内容");
+        tracer.mark_stage("decode", stage_decode_start.elapsed());
+        let total_input_tokens =
+            resolve_usage_input_tokens(input_tokens, context_usage_percentage, 0, model);
+        let resolved_cache = metering
+            .cache_usage
+            .resolve_against_total(total_input_tokens);
+        hook.record(
+            credential_id,
+            resolved_cache.input,
+            0,
+            resolved_cache.creation,
+            resolved_cache.read,
+            credits,
+            "error",
+        );
+        tracer.finalize(
+            "error",
+            Some(outcome::EMPTY_RESPONSE),
+            Some(UPSTREAM_EMPTY_COMPLETION_MESSAGE),
+            None,
+            TraceUsage {
+                input_tokens: resolved_cache.input.max(0) as u64,
+                output_tokens: 0,
+                cache_creation_tokens: resolved_cache.creation.max(0) as u64,
+                cache_read_tokens: resolved_cache.read.max(0) as u64,
+                credits: if credits.is_finite() && credits > 0.0 {
+                    credits
+                } else {
+                    0.0
+                },
+            },
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "api_error",
+                UPSTREAM_EMPTY_COMPLETION_MESSAGE,
+            )),
+        )
+            .into_response();
+    }
 
     // 估算输出 tokens（上游不下发 token，全部走估算）
     let output_tokens = token::estimate_output_tokens(&content);
@@ -1935,7 +2031,7 @@ fn create_buffered_sse_stream(
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
                                 // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
+                                let all_events = ctx.finish_and_get_all_events_interrupted();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "error");
                                 // 缓冲模式 chunk 读取失败：上游中途断流
@@ -1977,6 +2073,15 @@ fn create_buffered_sse_stream(
                                         "error",
                                         Some(outcome::BAD_REQUEST),
                                         Some(&message),
+                                        None,
+                                        trace_usage,
+                                    );
+                                } else if ctx.has_empty_completion_error() {
+                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                    tracer.finalize(
+                                        "error",
+                                        Some(outcome::EMPTY_RESPONSE),
+                                        Some(UPSTREAM_EMPTY_COMPLETION_MESSAGE),
                                         None,
                                         trace_usage,
                                     );
@@ -2067,6 +2172,14 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(!body.contains(secret));
         assert!(body.contains("Upstream API request failed"));
+    }
+
+    #[test]
+    fn non_stream_content_builder_preserves_empty_completion_for_handler_rejection() {
+        let content =
+            build_non_stream_content(false, String::new(), String::new(), None, Vec::new());
+
+        assert!(content.is_empty());
     }
 
     #[test]

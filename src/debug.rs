@@ -145,6 +145,11 @@ pub fn print_event_verbose(event: &Event) {
             println!("\n[事件] ContextUsage");
             println!("  context_usage_percentage: {}", e.context_usage_percentage);
         }
+        Event::Metadata(e) => {
+            println!("\n[事件] Metadata");
+            println!("  stop_reason: {:?}", e.stop_reason);
+            println!("  refusal: {:?}", e.stop_details.refusal);
+        }
         Event::Unknown { event_type, payload } => {
             println!("\n[事件] Unknown");
             println!("  event_type: {:?}", event_type);
@@ -190,6 +195,13 @@ pub fn print_event(event: &Event) {
         }
         Event::ContextUsage(e) => {
             println!("\n[上下文使用率] {}", e);
+        }
+        Event::Metadata(e) => {
+            if let Some(explanation) = e.refusal_explanation() {
+                println!("\n[上游拒绝] {}", explanation);
+            } else {
+                println!("\n[元数据] stop_reason={:?}", e.stop_reason);
+            }
         }
         Event::Unknown { event_type, .. } => {
             println!("\n[未知事件] {}", event_type);

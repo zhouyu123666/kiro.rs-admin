@@ -1350,6 +1350,17 @@ impl SseStateManager {
 
 use super::converter::get_context_window_size;
 
+/// 上游成功结束却没有返回任何 assistant 内容时给客户端的稳定错误信息。
+///
+/// 这是协议错误而不是一条模型回复：不能伪造文本，也不能继续发送正常的
+/// `message_stop`，否则 Claude Code 会把空结果标记为 success。
+pub(crate) const UPSTREAM_EMPTY_COMPLETION_MESSAGE: &str =
+    "Upstream completed without producing any response content.";
+
+/// `metadataEvent` 未携带具体解释时使用的可见拒绝文案。
+pub(crate) const UPSTREAM_REFUSAL_MESSAGE: &str =
+    "The upstream model refused to continue this conversation.";
+
 /// 流处理上下文
 pub struct StreamContext {
     /// SSE 状态管理器
@@ -1424,6 +1435,8 @@ pub struct StreamContext {
     tool_json_error: Option<ToolJsonAccumulatorError>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
+    /// 正常 EOF 时是否检测到了“成功但无任何输出”的上游协议错误。
+    empty_completion_error: bool,
 }
 
 impl StreamContext {
@@ -1508,7 +1521,23 @@ impl StreamContext {
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
+            empty_completion_error: false,
         }
+    }
+
+    /// 是否已经把本轮判定为上游空响应。
+    pub fn has_empty_completion_error(&self) -> bool {
+        self.empty_completion_error
+    }
+
+    /// 是否存在可以交付给 Anthropic 客户端的实际内容。
+    ///
+    /// 初始空 text block、usage/context 事件和 message_start 都不算输出；文本、
+    /// thinking、redacted thinking、tool_use 任一存在即可视为有效完成。
+    fn has_meaningful_output(&self) -> bool {
+        !self.output_text.trim().is_empty()
+            || !self.output_thinking.trim().is_empty()
+            || self.output_aux_tokens > 0
     }
 
     /// 生成 message_start 事件
@@ -1578,6 +1607,25 @@ impl StreamContext {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
+            Event::Metadata(metadata) => {
+                if !metadata.is_content_filtered() {
+                    tracing::debug!(
+                        stop_reason = ?metadata.stop_reason,
+                        "收到 Kiro metadataEvent"
+                    );
+                    return Vec::new();
+                }
+
+                let explanation = metadata
+                    .refusal_explanation()
+                    .unwrap_or(UPSTREAM_REFUSAL_MESSAGE);
+                self.state_manager.set_stop_reason("refusal");
+                tracing::warn!(
+                    category = ?metadata.refusal_category(),
+                    "上游模型因内容策略拒绝响应"
+                );
+                self.process_assistant_response(explanation)
+            }
             Event::ContextUsage(context_usage) => {
                 self.context_usage_percentage = Some(context_usage.context_usage_percentage);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
@@ -1615,7 +1663,18 @@ impl StreamContext {
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
             }
-            _ => Vec::new(),
+            Event::Unknown {
+                event_type,
+                payload,
+            } => {
+                // trace 级别保留 payload 仅用于协议升级诊断；默认生产日志不会输出。
+                tracing::trace!(
+                    event_type = %event_type,
+                    payload = %String::from_utf8_lossy(payload),
+                    "收到未知 Kiro 事件"
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -2387,8 +2446,20 @@ impl StreamContext {
         events
     }
 
-    /// 生成最终事件序列
+    /// 生成正常 EOF 的最终事件序列。
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        self.generate_final_events_with_empty_policy(true)
+    }
+
+    /// 上游读取中断时的收尾。中断已有更准确的错误原因，不应再误报为空响应。
+    pub fn generate_interrupted_final_events(&mut self) -> Vec<SseEvent> {
+        self.generate_final_events_with_empty_policy(false)
+    }
+
+    fn generate_final_events_with_empty_policy(
+        &mut self,
+        reject_empty_completion: bool,
+    ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
         // 收尾：flush <tool_use> XML 过滤器的残留（截断的未闭合块会被丢弃），
@@ -2493,6 +2564,29 @@ impl StreamContext {
             tracing::error!("{}", e);
             self.tool_json_error = Some(e);
             self.state_manager.set_stop_reason("error");
+        }
+
+        // HTTP 200 / 事件流 EOF 不等于模型成功生成了回复。若上游仅发送 usage、
+        // context 等元数据而没有任何 assistant 内容，必须以 SSE error 结束；继续
+        // 发送 message_stop 会让 Claude Code 错误地产生 success + result=""。
+        if reject_empty_completion
+            && self.tool_json_error.is_none()
+            && self.state_manager.get_stop_reason() == "end_turn"
+            && !self.has_meaningful_output()
+        {
+            self.empty_completion_error = true;
+            tracing::warn!("上游事件流正常结束，但没有产生任何 assistant 内容");
+            events.push(SseEvent::new(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": UPSTREAM_EMPTY_COMPLETION_MESSAGE
+                    }
+                }),
+            ));
+            return events;
         }
 
         // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
@@ -2602,6 +2696,18 @@ impl BufferedStreamContext {
     /// 2. 用正确的 input_tokens 更正 message_start 事件
     /// 3. 返回所有缓冲的事件
     pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
+        self.finish_and_get_all_events_with_empty_policy(true)
+    }
+
+    /// 上游读取中断时的收尾；保留中断这一更准确的根因，不再二次判为空响应。
+    pub fn finish_and_get_all_events_interrupted(&mut self) -> Vec<SseEvent> {
+        self.finish_and_get_all_events_with_empty_policy(false)
+    }
+
+    fn finish_and_get_all_events_with_empty_policy(
+        &mut self,
+        reject_empty_completion: bool,
+    ) -> Vec<SseEvent> {
         // 如果从未处理过事件，也要生成初始事件
         if !self.initial_events_generated {
             let initial_events = self.inner.generate_initial_events();
@@ -2613,7 +2719,18 @@ impl BufferedStreamContext {
         let resolved = self.inner.resolved_cache_usage();
 
         // 生成最终事件（StreamContext 内部会用同样的优先级与分摊）
-        let final_events = self.inner.generate_final_events();
+        let final_events = if reject_empty_completion {
+            self.inner.generate_final_events()
+        } else {
+            self.inner.generate_interrupted_final_events()
+        };
+        if self.inner.has_empty_completion_error() {
+            // 缓冲端点尚未发送 message_start；空响应时只返回标准 SSE error，
+            // 避免客户端先进入一条永远没有 content block 的 assistant message。
+            self.event_buffer.clear();
+            self.event_buffer.extend(final_events);
+            return std::mem::take(&mut self.event_buffer);
+        }
         self.event_buffer.extend(final_events);
 
         // 更正 message_start 事件中的 input_tokens 与 cache_* 字段
@@ -2655,6 +2772,10 @@ impl BufferedStreamContext {
         self.inner.tool_json_error_message()
     }
 
+    pub fn has_empty_completion_error(&self) -> bool {
+        self.inner.has_empty_completion_error()
+    }
+
     pub fn commit_cache(&self) {
         self.inner.commit_cache();
     }
@@ -2670,6 +2791,167 @@ pub fn estimate_tokens(text: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_completion_emits_api_error_instead_of_success() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            10,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let final_events = ctx.generate_final_events();
+
+        assert!(ctx.has_empty_completion_error());
+        assert_eq!(final_events.len(), 1);
+        assert_eq!(final_events[0].event, "error");
+        assert_eq!(final_events[0].data["error"]["type"], "api_error");
+        assert_eq!(
+            final_events[0].data["error"]["message"],
+            UPSTREAM_EMPTY_COMPLETION_MESSAGE
+        );
+        assert!(
+            final_events
+                .iter()
+                .all(|event| event.event != "message_stop"),
+            "空响应不能再以正常 message_stop 结束"
+        );
+    }
+
+    #[test]
+    fn non_empty_completion_keeps_normal_message_stop() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            10,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+        let mut response = crate::kiro::model::events::AssistantResponseEvent::default();
+        response.content = "visible response".to_string();
+        let _ = ctx.process_kiro_event(&Event::AssistantResponse(response));
+
+        let final_events = ctx.generate_final_events();
+
+        assert!(!ctx.has_empty_completion_error());
+        assert!(
+            final_events
+                .iter()
+                .any(|event| event.event == "message_stop")
+        );
+        assert!(final_events.iter().all(|event| event.event != "error"));
+    }
+
+    #[test]
+    fn content_filtered_metadata_becomes_visible_refusal() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            10,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+        let metadata = serde_json::from_value::<crate::kiro::model::events::MetadataEvent>(
+            serde_json::json!({
+                "stopDetails": {
+                    "refusal": {
+                        "category": "CYBER",
+                        "explanation": "The selected model cannot continue this conversation."
+                    }
+                },
+                "stopReason": "CONTENT_FILTERED"
+            }),
+        )
+        .unwrap();
+
+        let mut events = ctx.process_kiro_event(&Event::Metadata(metadata));
+        events.extend(ctx.generate_final_events());
+
+        assert!(!ctx.has_empty_completion_error());
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_delta"
+                && event.data["delta"]["text"]
+                    == "The selected model cannot continue this conversation."
+        }));
+        assert!(events.iter().any(|event| {
+            event.event == "message_delta" && event.data["delta"]["stop_reason"] == "refusal"
+        }));
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+        assert!(events.iter().all(|event| event.event != "error"));
+    }
+
+    #[test]
+    fn buffered_opus_4_8_empty_completion_returns_error_not_success() {
+        let mut ctx = BufferedStreamContext::new(
+            "claude-opus-4-8",
+            10,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+
+        let events = ctx.finish_and_get_all_events();
+
+        assert!(ctx.has_empty_completion_error());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "error");
+    }
+
+    #[test]
+    fn interrupted_empty_stream_is_not_relabelled_as_empty_completion() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            10,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let final_events = ctx.generate_interrupted_final_events();
+
+        assert!(!ctx.has_empty_completion_error());
+        assert!(
+            final_events
+                .iter()
+                .any(|event| event.event == "message_stop")
+        );
+    }
+
+    #[test]
+    fn context_window_stop_reason_is_not_relabelled_as_empty_completion() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-opus-5",
+            10,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+        let _ = ctx.process_kiro_event(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 100.0,
+            },
+        ));
+
+        let final_events = ctx.generate_final_events();
+
+        assert!(!ctx.has_empty_completion_error());
+        assert!(final_events.iter().any(|event| {
+            event.event == "message_delta"
+                && event.data["delta"]["stop_reason"] == "model_context_window_exceeded"
+        }));
+        assert!(
+            final_events
+                .iter()
+                .any(|event| event.event == "message_stop")
+        );
+    }
 
     // ---- ToolJsonAccumulator: 流式半截 / 非法工具调用 JSON ----
 

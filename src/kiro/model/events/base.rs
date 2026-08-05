@@ -18,6 +18,8 @@ pub enum EventType {
     ContextUsage,
     /// 推理内容事件
     ReasoningContent,
+    /// 停止原因、内容过滤等元数据事件
+    Metadata,
     /// 未知事件类型
     Unknown,
 }
@@ -31,6 +33,7 @@ impl EventType {
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
             "reasoningContentEvent" => Self::ReasoningContent,
+            "metadataEvent" => Self::Metadata,
             _ => Self::Unknown,
         }
     }
@@ -43,6 +46,7 @@ impl EventType {
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
             Self::ReasoningContent => "reasoningContentEvent",
+            Self::Metadata => "metadataEvent",
             Self::Unknown => "unknown",
         }
     }
@@ -77,8 +81,13 @@ pub enum Event {
     ContextUsage(super::ContextUsageEvent),
     /// 推理内容
     ReasoningContent(super::ReasoningContentEvent),
-    /// 未知事件 (保留原始帧数据)
-    Unknown {},
+    /// 停止原因、内容过滤等元数据
+    Metadata(super::MetadataEvent),
+    /// 未知事件（保留事件类型和原始 payload，避免新协议事件被静默吞掉）。
+    Unknown {
+        event_type: String,
+        payload: Vec<u8>,
+    },
     /// 服务端错误
     Error {
         /// 错误代码
@@ -134,7 +143,14 @@ impl Event {
                 let payload = super::ReasoningContentEvent::from_frame(&frame)?;
                 Ok(Self::ReasoningContent(payload))
             }
-            EventType::Unknown => Ok(Self::Unknown {}),
+            EventType::Metadata => {
+                let payload = super::MetadataEvent::from_frame(&frame)?;
+                Ok(Self::Metadata(payload))
+            }
+            EventType::Unknown => Ok(Self::Unknown {
+                event_type: event_type_str.to_string(),
+                payload: frame.payload,
+            }),
         }
     }
 
@@ -189,6 +205,7 @@ mod tests {
             EventType::from_str("reasoningContentEvent"),
             EventType::ReasoningContent
         );
+        assert_eq!(EventType::from_str("metadataEvent"), EventType::Metadata);
         assert_eq!(EventType::from_str("unknown_type"), EventType::Unknown);
     }
 
@@ -199,5 +216,38 @@ mod tests {
             "assistantResponseEvent"
         );
         assert_eq!(EventType::ToolUse.as_str(), "toolUseEvent");
+        assert_eq!(EventType::Metadata.as_str(), "metadataEvent");
+    }
+
+    #[test]
+    fn unknown_event_preserves_type_and_payload() {
+        use crate::kiro::parser::header::{HeaderValue, Headers};
+
+        let mut headers = Headers::new();
+        headers.insert(
+            ":message-type".to_string(),
+            HeaderValue::String("event".to_string()),
+        );
+        headers.insert(
+            ":event-type".to_string(),
+            HeaderValue::String("contentPolicyEvent".to_string()),
+        );
+        let payload = br#"{"reason":"blocked"}"#.to_vec();
+        let event = Event::from_frame(Frame {
+            headers,
+            payload: payload.clone(),
+        })
+        .unwrap();
+
+        match event {
+            Event::Unknown {
+                event_type,
+                payload: actual,
+            } => {
+                assert_eq!(event_type, "contentPolicyEvent");
+                assert_eq!(actual, payload);
+            }
+            other => panic!("expected unknown event, got {other:?}"),
+        }
     }
 }
