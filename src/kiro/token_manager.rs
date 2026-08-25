@@ -475,17 +475,27 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
-fn usage_limits_url(host: &str, _credentials: &KiroCredentials) -> String {
-    // Kiro 0.9.2 accepts these REST calls without profileArn. A resolved ARN is
-    // only for the streaming endpoint and makes this legacy request malformed.
-    format!(
+fn usage_limits_url(host: &str, credentials: &KiroCredentials) -> String {
+    let mut url = format!(
         "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
         host
-    )
+    );
+    // Enterprise/IdC accounts are authorized by the resolved profile ARN. Do
+    // not send BuilderID's placeholder ARN, which is not a real profile.
+    if let Some(profile_arn) = credentials.effective_profile_arn() {
+        url.push_str("&profileArn=");
+        url.push_str(&urlencoding::encode(profile_arn));
+    }
+    url
 }
 
-fn available_models_url(host: &str, _credentials: &KiroCredentials) -> String {
-    format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
+fn available_models_url(host: &str, credentials: &KiroCredentials) -> String {
+    let mut url = format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host);
+    if let Some(profile_arn) = credentials.effective_profile_arn() {
+        url.push_str("&profileArn=");
+        url.push_str(&urlencoding::encode(profile_arn));
+    }
+    url
 }
 
 /// 获取使用额度信息
@@ -5057,7 +5067,7 @@ mod tests {
     }
 
     #[test]
-    fn test_usage_rest_urls_omit_resolved_profile_arn() {
+    fn test_usage_rest_urls_include_resolved_profile_arn() {
         let credentials = KiroCredentials {
             profile_arn: Some(
                 "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
@@ -5066,13 +5076,10 @@ mod tests {
         };
         let host = "q.us-east-1.amazonaws.com";
 
-        assert_eq!(
-            usage_limits_url(host, &credentials),
-            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
-        );
+        assert_eq!(usage_limits_url(host, &credentials), "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123");
         assert_eq!(
             available_models_url(host, &credentials),
-            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
+            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&profileArn=arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123"
         );
     }
 
