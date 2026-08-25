@@ -98,8 +98,11 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Keep architecture-specific compiler caches separate. Sharing a
+          # cache between amd64 and arm64 can cause cache thrashing and makes
+          # concurrent matrix jobs overwrite each other's layers.
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}
           push: true
           provenance: false
           tags: ${{ steps.repo.outputs.image }}:${{ steps.version.outputs.version }}-${{ matrix.arch }}
