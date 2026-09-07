@@ -1412,6 +1412,12 @@ async fn handle_non_stream_request(
 
     // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
     let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
+    // 非流式响应没有经过 StreamContext 的逐事件出口，这里复用同一套短 token 复读熔断，
+    // 防止退化 thinking / text 在一次性响应中把垃圾完整带回客户端和下一轮上下文。
+    let text_content =
+        super::stream::collapse_repeated_short_line_floods(&text_content).into_owned();
+    let native_thinking =
+        super::stream::collapse_repeated_short_line_floods(&native_thinking).into_owned();
 
     // 构建响应内容
     let mut content = build_non_stream_content(

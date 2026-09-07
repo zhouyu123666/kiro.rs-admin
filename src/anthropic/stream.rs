@@ -556,30 +556,44 @@ fn find_next_param_open(body: &str, from: usize) -> Option<usize> {
 /// `call` / `count` / `card` / `course` / `court`。集合形式便于以后扩充。
 const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card", "course", "court"];
 
-/// 复读熔断阈值：同一个 stray token（call/count/card/course/court）连续作为独占一行重复出现
-/// 超过这么多次，判定为「Opus 长上下文退化复读死循环」，立即熔断本轮文本输出。
+/// 复读熔断阈值：同一个短原子行连续重复出现超过这么多次，判定为模型退化复读死循环。
 ///
-/// 取值权衡：正常工具调用前最多出现 1 个引导词行（偶有 2~3），绝不会连续几十次。
-/// 设为 32 远高于正常上限、又远低于退化时的数万次，既不误伤正常引导词，又能尽早止血。
+/// 正常工具调用前最多出现 1 个引导词行（偶有 2~3），普通思考也不应把同一个短 token
+/// 连续输出几十次；32 既给正常输出留出余量，又能在退化输出扩大前止血。
 const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 32;
 
-/// 块级复读折叠：对「已完整的整段文本」做一次性复读熔断。
+/// 参与通用复读检测的单行最大字节数。
 ///
-/// 用于非流式 / web_search loop 路径（`extract_invoke_content_blocks` 入口）——
-/// 那条路不经过流式 `emit_text_delta_raw` 的逐 chunk 熔断，所以在这里独立兜一次。
+/// 只检测短原子行，避免把合法的长代码行或自然语言段落误判为复读；`33`、`call`、
+/// `count` 等退化输出都属于这一类。
+const REPEAT_GUARD_MAX_CANDIDATE_BYTES: usize = 128;
+
+fn is_repeat_guard_candidate(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+
+    STRAY_INVOKE_TOKENS.contains(&line)
+        || (line.len() <= REPEAT_GUARD_MAX_CANDIDATE_BYTES
+            && line
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
+}
+
+/// 对已完整的整段普通文本做一次性复读熔断。
 ///
-/// 规则与流式版一致：同一个 `STRAY_INVOKE_TOKENS`
-///（call/count/card/course/court）连续作为独占一行
-/// 重复超过 `REPEAT_GUARD_TRIP_THRESHOLD` 次，判定为 Opus 退化复读，**从超阈值处截断**，
+/// 规则与流式版一致：同一个短原子行连续作为独占一行重复超过
+/// `REPEAT_GUARD_TRIP_THRESHOLD` 次，判定为模型退化复读，**从超阈值处截断**，
 /// 丢弃其后的全部复读垃圾（断雪球、不灌历史）。阈值内的少量引导词重复原样保留。
-fn collapse_stray_token_floods(text: &str) -> std::borrow::Cow<'_, str> {
+fn collapse_plain_repeated_short_line_floods(text: &str) -> std::borrow::Cow<'_, str> {
     let mut last_line = "";
     let mut run: u32 = 0;
     let mut cut_at: Option<usize> = None;
     let mut offset = 0usize;
     for segment in text.split_inclusive('\n') {
         let line = segment.trim();
-        if STRAY_INVOKE_TOKENS.contains(&line) {
+        if is_repeat_guard_candidate(line) {
             if line == last_line {
                 run += 1;
             } else {
@@ -601,6 +615,48 @@ fn collapse_stray_token_floods(text: &str) -> std::borrow::Cow<'_, str> {
         Some(pos) => std::borrow::Cow::Owned(text[..pos].to_string()),
         None => std::borrow::Cow::Borrowed(text),
     }
+}
+
+/// 折叠复读内容，但保留结构化 `<invoke>` 工具参数原文。
+///
+/// 工具参数本身可能合法地包含大量相同短行（例如 patch 中连续的 `33`），因此复读保护
+/// 只作用于 invoke 块外的 assistant 文本。未闭合的 invoke 会按普通文本交给上层现有的
+/// 截断 / 错误处理逻辑，不擅自丢弃其内容。
+pub(crate) fn collapse_repeated_short_line_floods(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut cursor = 0;
+    let mut output = String::new();
+    let mut saw_invoke = false;
+
+    loop {
+        let rest = &text[cursor..];
+        let Some(start) = find_invoke_start(rest) else {
+            let collapsed = collapse_plain_repeated_short_line_floods(rest);
+            if !saw_invoke && matches!(collapsed, std::borrow::Cow::Borrowed(_)) {
+                return collapsed;
+            }
+            output.push_str(&collapsed);
+            break;
+        };
+
+        let collapsed_prefix = collapse_plain_repeated_short_line_floods(&rest[..start]);
+        if !saw_invoke && matches!(collapsed_prefix, std::borrow::Cow::Borrowed(_)) {
+            output.push_str(&rest[..start]);
+        } else {
+            output.push_str(&collapsed_prefix);
+        }
+
+        let Some(end) = find_invoke_block_end(rest, start) else {
+            // 未闭合块不做通用复读折叠，避免破坏参数或改变现有错误语义。
+            output.push_str(&rest[start..]);
+            break;
+        };
+
+        output.push_str(&rest[start..end]);
+        cursor += end;
+        saw_invoke = true;
+    }
+
+    std::borrow::Cow::Owned(output)
 }
 
 fn strip_trailing_stray_tokens(before: &str) -> &str {
@@ -800,9 +856,9 @@ pub(crate) fn extract_invoke_content_blocks(
     known_tool_names: &std::collections::HashSet<String>,
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> Vec<serde_json::Value> {
-    // 🛑 块级复读熔断：先把 Opus 退化的「同一 stray token 连续复读」截断，
+    // 🛑 块级复读熔断：先把模型退化的「同一短 token 连续复读」截断，
     // 再做 invoke 嗅探。覆盖 web_search loop（99.9% 真实流量）这条非流式路径。
-    let collapsed = collapse_stray_token_floods(text);
+    let collapsed = collapse_repeated_short_line_floods(text);
     let text: &str = &collapsed;
     let mut blocks: Vec<serde_json::Value> = Vec::new();
     let mut pending_text = String::new();
@@ -1419,9 +1475,9 @@ pub struct StreamContext {
     pub cache_meter: Option<super::cache_metering::SharedCacheMeter>,
     /// meteringEvent 上报的 credit 计费量（上游真实下发）
     pub credits: f64,
-    /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
-    /// Opus 长上下文退化时会把同一个 stray token（call/count/card）一行一行无限复读，
-    /// 我们在文本出口处统计「同一短行连续重复了多少次」。
+    /// 复读熔断：最近一次作为输出吐出的「尾行」内容（去空白）。
+    /// 模型长上下文退化时可能把同一个短 token 一行一行无限复读，
+    /// 我们在内容入口处统计「同一短行连续重复了多少次」。
     repeat_guard_last_line: String,
     /// 复读熔断：当前尾行已连续重复的次数。
     repeat_guard_run: u32,
@@ -1687,6 +1743,7 @@ impl StreamContext {
         if content.is_empty() {
             return Vec::new();
         }
+
         let content = content.as_str();
 
         let mut events = Vec::new();
@@ -1789,6 +1846,7 @@ impl StreamContext {
                 if let Some(end_pos) = find_real_thinking_end_tag(&self.thinking_buffer) {
                     // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
+                    let thinking_content = self.repeat_guard_filter(&thinking_content);
                     if !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
                             events.push(
@@ -1830,6 +1888,7 @@ impl StreamContext {
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
+                        let safe_content = self.repeat_guard_filter(&safe_content);
                         if !safe_content.is_empty() {
                             if let Some(thinking_index) = self.thinking_block_index {
                                 events.push(
@@ -2017,15 +2076,7 @@ impl StreamContext {
     /// 当发生 tool_use 时，状态机会自动关闭当前文本块；后续文本会自动创建新的文本块继续输出。
     ///
     /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
-    /// 复读熔断过滤器：在文本真正吐给客户端之前，逐行检测「同一 stray token 连续复读」。
-    ///
-    /// 工作方式（流式安全，跨 chunk 累计）：
-    /// - 把进来的 `text` 按行切，逐行和上一行（去空白）比较；
-    /// - 只对 `STRAY_INVOKE_TOKENS`（call/count/card）这类退化引导词计数，普通文本一律放行；
-    /// - 同一 stray token 连续重复达到 `REPEAT_GUARD_TRIP_THRESHOLD` 即「跳闸」；
-    /// - 跳闸后：本轮内后续任何文本（含继续复读的 count）一律丢弃，返回空串。
-    ///
-    /// 返回应当继续吐出的文本（跳闸时返回空串）。
+    /// 在普通文本或 thinking 内容出口处执行跨 chunk 的短行复读熔断。
     fn repeat_guard_filter(&mut self, text: &str) -> String {
         // 已跳闸：本轮剩余文本全部丢弃，断雪球。
         if self.repeat_guard_tripped {
@@ -2036,7 +2087,7 @@ impl StreamContext {
         // 用 split_inclusive 保留换行符，确保放行的正常文本不丢字节。
         for segment in text.split_inclusive('\n') {
             let line = segment.trim();
-            if STRAY_INVOKE_TOKENS.contains(&line) {
+            if is_repeat_guard_candidate(line) {
                 if line == self.repeat_guard_last_line {
                     self.repeat_guard_run += 1;
                 } else {
@@ -2044,6 +2095,11 @@ impl StreamContext {
                     self.repeat_guard_run = 1;
                 }
                 if self.repeat_guard_run >= REPEAT_GUARD_TRIP_THRESHOLD {
+                    tracing::warn!(
+                        repeated_line = %line,
+                        threshold = REPEAT_GUARD_TRIP_THRESHOLD,
+                        "检测到模型短 token 复读，熔断本轮输出"
+                    );
                     // 跳闸：丢弃这一行及本轮后续所有文本。已经放行的 kept 保留
                     // （阈值内的少量重复无害），但不再追加，并标记 tripped。
                     self.repeat_guard_tripped = true;
@@ -2066,14 +2122,13 @@ impl StreamContext {
     fn emit_text_delta_raw(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        // 🛑 复读熔断（root cause: Opus 长上下文退化，把同一 stray token 一行行无限复读）。
-        // 在文本出口处过滤：一旦同一短行连续重复超过阈值，丢弃后续复读文本，
-        // 既不让它喷给客户端、不烧满 max_tokens，也不写进对话历史（断雪球）。
+        // 这里已经位于 invoke 嗅探之后，只处理真正要作为普通文本交付的内容；
+        // 工具调用参数不会经过此熔断，避免误改合法参数中的重复短行。
         let kept = self.repeat_guard_filter(text);
         if kept.is_empty() {
             return events;
         }
-        let text: &str = &kept;
+        let text = kept.as_str();
 
         // 🅱 维护跨流的代码围栏奇偶状态：所有真正作为「文本」吐出的内容都过这里，
         // 在此累进围栏状态，使后续 <invoke> 能判断自己是否落在代码块内。
@@ -2208,6 +2263,8 @@ impl StreamContext {
         &mut self,
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
+        // 原生 reasoningContentEvent 不会经过 process_assistant_response，必须在这里做同一
+        // 次熔断；这正是 `33` 洪水绕过旧保护的路径。
         if !self.thinking_enabled {
             if let Some(text) = reasoning.text.as_deref()
                 && !text.is_empty()
@@ -2219,6 +2276,12 @@ impl StreamContext {
             return Vec::new();
         }
 
+        let filtered_text = reasoning
+            .text
+            .as_deref()
+            .filter(|text| !text.is_empty())
+            .map(|text| self.repeat_guard_filter(text));
+
         let mut events = Vec::new();
 
         if let Some(signature) = reasoning.signature.as_deref()
@@ -2227,7 +2290,7 @@ impl StreamContext {
             self.pending_thinking_signature = Some(signature.to_string());
         }
 
-        if let Some(text) = reasoning.text.as_deref()
+        if let Some(text) = filtered_text.as_deref()
             && !text.is_empty()
         {
             self.output_thinking.push_str(text);
@@ -2379,6 +2442,7 @@ impl StreamContext {
         if self.thinking_enabled && self.in_thinking_block {
             if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer) {
                 let thinking_content = self.thinking_buffer[..end_pos].to_string();
+                let thinking_content = self.repeat_guard_filter(&thinking_content);
                 if !thinking_content.is_empty() {
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(
@@ -2485,6 +2549,7 @@ impl StreamContext {
                     find_real_thinking_end_tag_at_buffer_end(&self.thinking_buffer)
                 {
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
+                    let thinking_content = self.repeat_guard_filter(&thinking_content);
                     if !thinking_content.is_empty() {
                         if let Some(thinking_index) = self.thinking_block_index {
                             events.push(
@@ -2514,9 +2579,11 @@ impl StreamContext {
                     }
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
+                    let thinking_buffer = self.thinking_buffer.clone();
+                    let thinking_buffer = self.repeat_guard_filter(&thinking_buffer);
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
+                            self.create_thinking_delta_event(thinking_index, &thinking_buffer),
                         );
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
@@ -5267,9 +5334,102 @@ mod tests {
         );
     }
 
-    // ---- 块级复读熔断 (collapse_stray_token_floods)：覆盖 web_search loop 路径 ----
+    /// 回归截图中的真实形态：非工具引导词的短 token 也必须被熔断。
+    #[test]
+    fn repeat_guard_trips_on_generic_short_token_flood() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
 
-    /// 🔴→🟢 块级路径（extract_invoke_content_blocks / web_search loop）也必须熔断 count 洪水。
+        let mut payload = String::from("前面的正常回答。\n\n");
+        for _ in 0..2000 {
+            payload.push_str("33\n");
+        }
+        let mut all = ctx.process_assistant_response(&payload);
+        all.extend(ctx.generate_final_events());
+
+        let text = collect_text_content(&all);
+        assert!(ctx.repeat_guard_tripped, "通用短 token 洪水应触发熔断");
+        assert!(
+            text.matches("33").count() < 64,
+            "33 复读不应完整泄漏：实际={}",
+            text.matches("33").count()
+        );
+        assert!(
+            text.contains("前面的正常回答"),
+            "正常回答不能被误删: {text:?}"
+        );
+    }
+
+    #[test]
+    fn repeat_guard_trips_on_inband_thinking_short_token_flood() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let mut payload = String::from("<thinking>\n");
+        for _ in 0..2000 {
+            payload.push_str("33\n");
+        }
+        payload.push_str("</thinking>\n\n最终回答");
+
+        let mut all = ctx.process_assistant_response(&payload);
+        all.extend(ctx.generate_final_events());
+
+        let thinking = collect_thinking_content(&all);
+        assert!(ctx.repeat_guard_tripped, "带内 thinking 洪水应触发熔断");
+        assert!(
+            thinking.matches("33").count() < 64,
+            "带内 thinking 中的 33 复读不应完整泄漏：实际={}",
+            thinking.matches("33").count()
+        );
+    }
+
+    /// 原生 reasoningContentEvent 直发 thinking_delta，必须和普通文本共用复读熔断。
+    #[test]
+    fn repeat_guard_trips_on_native_reasoning_short_token_flood() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut all = ctx.generate_initial_events();
+
+        for _ in 0..2000 {
+            all.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: Some("33\n".to_string()),
+                    signature: None,
+                    redacted_content: None,
+                },
+            )));
+        }
+        all.extend(ctx.generate_final_events());
+
+        let thinking = collect_thinking_content(&all);
+        assert!(ctx.repeat_guard_tripped, "原生 thinking 洪水应触发熔断");
+        assert!(
+            thinking.matches("33").count() < 64,
+            "原生 thinking 中的 33 复读不应完整泄漏：实际={}",
+            thinking.matches("33").count()
+        );
+    }
+
+    // ---- 块级复读熔断 (collapse_repeated_short_line_floods)：覆盖 web_search loop 路径 ----
+
+    /// 🔴→🟢 块级路径（extract_invoke_content_blocks / web_search loop）也必须熔断短 token 洪水。
     #[test]
     fn extract_blocks_collapses_count_flood() {
         let mut text = String::from("先看 crawlee 状态。\n\ncall\n\n");
@@ -5311,6 +5471,20 @@ mod tests {
             "单个引导词不应触发折叠，invoke 应捞回: {:?}",
             blocks
         );
+    }
+
+    #[test]
+    fn non_stream_repeat_guard_preserves_repeated_lines_inside_invoke_parameters() {
+        let mut text =
+            String::from("<invoke name=\"exec_command\"><parameter name=\"cmd\">apply_patch\n");
+        for _ in 0..64 {
+            text.push_str("33\n");
+        }
+        text.push_str("</parameter></invoke>");
+
+        let collapsed = collapse_repeated_short_line_floods(&text);
+
+        assert_eq!(collapsed.as_ref(), text);
     }
 
     #[test]

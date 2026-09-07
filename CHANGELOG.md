@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 🔧 修复 — Claude 长会话短 token 无限复读
+
+- 复读熔断从 `call` / `count` 等固定工具引导词扩展到短原子行，覆盖截图中 `33` 这类退化输出。
+- 普通 assistant 文本、带内 thinking、Kiro 原生 `reasoningContentEvent` 以及非流式响应统一执行熔断，达到 32 次连续重复后丢弃后续垃圾内容。
+- 新增普通文本和原生 thinking 的回归测试，避免重复内容继续刷屏、消耗输出预算并进入下一轮上下文。
+
 ### 🔧 修复 — Thinking 签名与边界一致性
 
 - 不再为无签名的 thinking 块注入 `kiro-rs-thinking-signature`；只有 Kiro 原生 `reasoningContentEvent` 提供非空签名时才原样透传。
