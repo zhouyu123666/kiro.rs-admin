@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -25,6 +25,7 @@ pub struct ChatCompletionRequest {
     pub reasoning_effort: Option<String>,
     pub reasoning: Option<Value>,
     pub stream_options: Option<StreamOptions>,
+    pub prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -53,6 +54,8 @@ pub struct OpenAIToolCall {
     #[serde(rename = "type", default = "default_function_type")]
     pub tool_type: String,
     pub function: OpenAIFunctionCall,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -62,7 +65,7 @@ pub struct OpenAIFunctionCall {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenAITool {
     #[serde(rename = "type", default = "default_function_type")]
     pub tool_type: String,
@@ -70,9 +73,13 @@ pub struct OpenAITool {
     pub name: Option<String>,
     pub description: Option<String>,
     pub parameters: Option<Value>,
+    #[serde(default)]
+    pub tools: Vec<OpenAITool>,
+    pub namespace: Option<String>,
+    pub format: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenAIToolFunction {
     pub name: String,
     pub description: Option<String>,
@@ -96,12 +103,35 @@ pub struct ResponsesRequest {
     pub max_tokens: Option<i32>,
     pub reasoning: Option<Value>,
     pub metadata: Option<Value>,
+    pub prompt_cache_key: Option<String>,
+    #[serde(default = "default_parallel_tool_calls")]
+    pub parallel_tool_calls: bool,
 }
+
+fn default_parallel_tool_calls() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredToolKind {
+    Function,
+    Custom,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeclaredTool {
+    pub kind: DeclaredToolKind,
+    pub name: String,
+    pub namespace: Option<String>,
+}
+
+pub type ToolKindMap = HashMap<String, DeclaredTool>;
 
 #[derive(Debug)]
 pub struct ConvertedOpenAIRequest {
     pub anthropic: MessagesRequest,
     pub openai_messages: Vec<OpenAIMessage>,
+    pub tool_kinds: ToolKindMap,
 }
 
 #[derive(Debug)]
@@ -134,6 +164,13 @@ pub fn openai_model_to_kiro_model(model: &str) -> String {
     }
 
     let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    ) {
+        return lower;
+    }
+
     let looks_openai_native = lower.starts_with("gpt-")
         || lower.starts_with("o1")
         || lower.starts_with("o3")
@@ -149,6 +186,13 @@ pub fn openai_model_to_kiro_model(model: &str) -> String {
 pub fn chat_to_anthropic(
     req: &ChatCompletionRequest,
 ) -> Result<ConvertedOpenAIRequest, OpenAIConversionError> {
+    chat_to_anthropic_with_metadata(req, None)
+}
+
+pub fn chat_to_anthropic_with_metadata(
+    req: &ChatCompletionRequest,
+    metadata: Option<crate::anthropic::types::Metadata>,
+) -> Result<ConvertedOpenAIRequest, OpenAIConversionError> {
     if req.messages.is_empty() {
         return Err(err("messages must contain at least one message"));
     }
@@ -160,11 +204,19 @@ pub fn chat_to_anthropic(
     }
 
     let (thinking, output_config) = openai_reasoning_to_anthropic(
+        &model,
         req.reasoning_effort.as_deref(),
         req.reasoning.as_ref(),
     );
 
-    let tools = convert_openai_tools(&req.tools);
+    let (mut tools, tool_kinds) = convert_openai_tools(&req.tools);
+    let tool_choice = convert_tool_choice(req.tool_choice.as_ref());
+    if tool_choice
+        .as_ref()
+        .is_some_and(|choice| choice.get("type").and_then(Value::as_str) == Some("none"))
+    {
+        tools = None;
+    }
     // OpenAI/Codex 客户端带 web_search 时强制走 agentic loop：纯快速路径恒返回 SSE 且
     // 只吐原始 web_search_tool_result 块，OpenAI 层既无法解析（非流式 502）也无法合成答案。
     let force_web_search_loop = tools
@@ -183,13 +235,14 @@ pub fn chat_to_anthropic(
             stream: req.stream,
             system,
             tools,
-            tool_choice: convert_tool_choice(req.tool_choice.as_ref()),
+            tool_choice,
             thinking,
             output_config,
-            metadata: None,
+            metadata,
             force_web_search_loop,
         },
         openai_messages: req.messages.clone(),
+        tool_kinds,
     })
 }
 
@@ -217,6 +270,21 @@ pub fn responses_to_chat_request(
         return Err(err("input must contain at least one message"));
     }
 
+    let mut tools = req.tools.clone();
+    if let Some(Value::Array(items)) = req.input.as_ref() {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("additional_tools")
+                && let Some(entries) = item.get("tools").and_then(Value::as_array)
+            {
+                for entry in entries {
+                    let tool = serde_json::from_value::<OpenAITool>(entry.clone())
+                        .map_err(|error| err(format!("invalid additional tool: {error}")))?;
+                    tools.push(tool);
+                }
+            }
+        }
+    }
+
     Ok(ChatCompletionRequest {
         model: req
             .model
@@ -227,11 +295,12 @@ pub fn responses_to_chat_request(
         stream: req.stream,
         max_tokens: req.max_tokens,
         max_completion_tokens: req.max_output_tokens,
-        tools: req.tools.clone(),
+        tools,
         tool_choice: req.tool_choice.clone(),
         reasoning_effort: None,
         reasoning: req.reasoning.clone(),
         stream_options: None,
+        prompt_cache_key: req.prompt_cache_key.clone(),
     })
 }
 
@@ -279,6 +348,9 @@ fn response_input_item_to_messages(
     let role = obj.get("role").and_then(Value::as_str).unwrap_or_default();
 
     match typ {
+        "additional_tools" | "reasoning" | "web_search_call" | "compaction" => {
+            Ok(Vec::new())
+        }
         "message" => {
             let role = if role.is_empty() { "user" } else { role };
             Ok(vec![OpenAIMessage {
@@ -313,6 +385,14 @@ fn response_input_item_to_messages(
             let id = first_string(obj, &["call_id", "id"]);
             let name = first_string(obj, &["name"]);
             let arguments = stringify_value(obj.get("arguments"));
+            if !arguments.trim().is_empty()
+                && serde_json::from_str::<Value>(&arguments).is_err()
+            {
+                return Err(err(format!(
+                    "input function_call {} has invalid JSON arguments",
+                    id.as_deref().unwrap_or_default()
+                )));
+            }
             Ok(vec![OpenAIMessage {
                 role: "assistant".to_string(),
                 content: Some(Value::String(String::new())),
@@ -323,12 +403,33 @@ fn response_input_item_to_messages(
                         name: name.unwrap_or_default(),
                         arguments,
                     },
+                    namespace: first_string(obj, &["namespace"]),
                 }],
                 tool_call_id: None,
                 name: None,
             }])
         }
-        "function_call_output" | "tool_result" => Ok(vec![OpenAIMessage {
+        "custom_tool_call" => {
+            let id = first_string(obj, &["call_id", "id"]);
+            let name = first_string(obj, &["name"]);
+            let input = stringify_value(obj.get("input"));
+            Ok(vec![OpenAIMessage {
+                role: "assistant".to_string(),
+                content: Some(Value::String(String::new())),
+                tool_calls: vec![OpenAIToolCall {
+                    id,
+                    tool_type: "custom".to_string(),
+                    function: OpenAIFunctionCall {
+                        name: name.unwrap_or_default(),
+                        arguments: input,
+                    },
+                    namespace: first_string(obj, &["namespace"]),
+                }],
+                tool_call_id: None,
+                name: None,
+            }])
+        }
+        "function_call_output" | "custom_tool_call_output" | "tool_result" => Ok(vec![OpenAIMessage {
             role: "tool".to_string(),
             content: obj.get("output").cloned().or_else(|| obj.get("content").cloned()),
             tool_calls: Vec::new(),
@@ -459,14 +560,19 @@ fn split_chat_messages(
 fn assistant_content_to_anthropic(msg: &OpenAIMessage) -> Result<Value, OpenAIConversionError> {
     let mut blocks = content_to_text_blocks(msg.content.as_ref())?;
     for call in &msg.tool_calls {
-        if call.tool_type != "function" {
+        if call.tool_type != "function" && call.tool_type != "custom" {
             continue;
         }
+        let input = if call.tool_type == "custom" {
+            json!({ "input": call.function.arguments })
+        } else {
+            parse_tool_arguments(&call.function.arguments)
+        };
         blocks.push(json!({
             "type": "tool_use",
             "id": call.id.clone().unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple())),
-            "name": call.function.name,
-            "input": parse_tool_arguments(&call.function.arguments),
+            "name": flat_tool_name(call.namespace.as_deref(), &call.function.name),
+            "input": input,
         }));
     }
 
@@ -624,8 +730,26 @@ fn is_openai_web_search_tool(tool_type: &str) -> bool {
     tool_type == "web_search" || tool_type.starts_with("web_search_")
 }
 
-fn convert_openai_tools(tools: &[OpenAITool]) -> Option<Vec<Tool>> {
+pub fn flat_tool_name(namespace: Option<&str>, name: &str) -> String {
+    match namespace {
+        Some(namespace) if !namespace.is_empty() => format!("{namespace}__{name}"),
+        _ => name.to_string(),
+    }
+}
+
+fn convert_openai_tools(tools: &[OpenAITool]) -> (Option<Vec<Tool>>, ToolKindMap) {
     let mut out = Vec::new();
+    let mut kinds = ToolKindMap::new();
+    convert_openai_tool_entries(tools, None, &mut out, &mut kinds);
+    ((!out.is_empty()).then_some(out), kinds)
+}
+
+fn convert_openai_tool_entries(
+    tools: &[OpenAITool],
+    namespace: Option<&str>,
+    out: &mut Vec<Tool>,
+    kinds: &mut ToolKindMap,
+) {
     for tool in tools {
         // 内置 web search：转成 Anthropic 原生工具，交给后端 web_search 路由/agentic loop。
         if is_openai_web_search_tool(&tool.tool_type) {
@@ -647,26 +771,82 @@ fn convert_openai_tools(tools: &[OpenAITool]) -> Option<Vec<Tool>> {
             });
             continue;
         }
-        if tool.tool_type != "function" {
-            continue;
+        match tool.tool_type.as_str() {
+            "namespace" => {
+                let Some(name) = tool.name.as_deref().filter(|name| !name.trim().is_empty()) else {
+                    continue;
+                };
+                if namespace.is_some() {
+                    tracing::warn!("忽略嵌套 OpenAI namespace 工具组: {}", name);
+                    continue;
+                }
+                let start = out.len();
+                convert_openai_tool_entries(&tool.tools, Some(name), out, kinds);
+                if let Some(description) = tool.description.as_deref().filter(|text| !text.is_empty()) {
+                    for converted in &mut out[start..] {
+                        converted.description = format!("[{name}] {description}\n{}", converted.description);
+                    }
+                }
+            }
+            "function" | "custom" => {
+                let Some(function) = tool_function(tool) else {
+                    continue;
+                };
+                let name = function.0.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                let flat = flat_tool_name(namespace, name);
+                let kind = if tool.tool_type == "custom" {
+                    DeclaredToolKind::Custom
+                } else {
+                    DeclaredToolKind::Function
+                };
+                let mut description = function.1.unwrap_or_else(|| name.to_string());
+                let input_schema = if kind == DeclaredToolKind::Custom {
+                    if let Some(format) = &tool.format
+                        && let Some(definition) = format.get("definition").and_then(Value::as_str)
+                    {
+                        let syntax = format
+                            .get("syntax")
+                            .and_then(Value::as_str)
+                            .unwrap_or("grammar");
+                        description.push_str(&format!("\n\nInput format ({syntax} grammar):\n{definition}"));
+                    }
+                    schema_to_btree(Some(json!({
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "type": "string",
+                                "description": "The complete raw tool input text. Do NOT wrap it in JSON or escape it."
+                            }
+                        },
+                        "required": ["input"],
+                        "additionalProperties": false
+                    })))
+                } else {
+                    schema_to_btree(function.2)
+                };
+                kinds.insert(
+                    flat.clone(),
+                    DeclaredTool {
+                        kind,
+                        name: name.to_string(),
+                        namespace: namespace.map(str::to_string),
+                    },
+                );
+                out.push(Tool {
+                    tool_type: None,
+                    name: flat,
+                    description,
+                    input_schema,
+                    max_uses: None,
+                    cache_control: None::<CacheControl>,
+                });
+            }
+            other => tracing::warn!(tool_type = %other, "忽略不支持的 OpenAI 工具类型"),
         }
-        let Some(function) = tool_function(tool) else {
-            continue;
-        };
-        let name = function.0.trim();
-        if name.is_empty() {
-            continue;
-        }
-        out.push(Tool {
-            tool_type: None,
-            name: name.to_string(),
-            description: function.1.unwrap_or_else(|| name.to_string()),
-            input_schema: schema_to_btree(function.2),
-            max_uses: None,
-            cache_control: None::<CacheControl>,
-        });
     }
-    (!out.is_empty()).then_some(out)
 }
 
 fn tool_function(tool: &OpenAITool) -> Option<(&str, Option<String>, Option<Value>)> {
@@ -715,10 +895,18 @@ fn convert_tool_choice(choice: Option<&Value>) -> Option<Value> {
     if let Some(name) = function_name {
         return Some(json!({"type": "tool", "name": name}));
     }
+    if let Some(name) = choice.get("name").and_then(Value::as_str) {
+        let namespace = choice.get("namespace").and_then(Value::as_str);
+        return Some(json!({
+            "type": "tool",
+            "name": flat_tool_name(namespace, name),
+        }));
+    }
     Some(choice.clone())
 }
 
 fn openai_reasoning_to_anthropic(
+    model: &str,
     reasoning_effort: Option<&str>,
     reasoning: Option<&Value>,
 ) -> (Option<Thinking>, Option<OutputConfig>) {
@@ -743,11 +931,28 @@ fn openai_reasoning_to_anthropic(
     //   `EffortTier::parse("none")` 会失败并 fallback 到 high，等于把“关推理”变成高强度推理。
     // - "minimal"：后端无此档，降级到最低的 low（原样透传同样会被 parse 拒绝 → fallback high）。
     // - 其他未知值：兜底 medium。
+    let is_gpt_5_6 = matches!(
+        model.to_ascii_lowercase().as_str(),
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    );
+    if effort == "none" {
+        return if is_gpt_5_6 {
+            (
+                None,
+                Some(OutputConfig {
+                    effort: "none".to_string(),
+                }),
+            )
+        } else {
+            (None, None)
+        };
+    }
+
     let (budget, normalized_effort) = match effort.as_str() {
-        "none" => return (None, None),
         "minimal" | "low" => (4_000, "low"),
         "medium" => (12_000, "medium"),
         "high" => (20_000, "high"),
+        "max" if is_gpt_5_6 => (20_000, "max"),
         "xhigh" | "max" => (20_000, "xhigh"),
         _ => (12_000, "medium"),
     };
@@ -821,12 +1026,18 @@ pub struct AssistantParts {
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: i64,
     pub model: String,
+    pub web_searches: Vec<(String, String)>,
+    pub reasoning_tokens: i64,
+    pub credit_usage: Option<f64>,
+    pub credit_unit: Option<String>,
+    pub credit_unit_plural: Option<String>,
 }
 
 pub fn assistant_parts_from_anthropic(value: &Value) -> AssistantParts {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
+    let mut web_searches = Vec::new();
 
     if let Some(items) = value.get("content").and_then(Value::as_array) {
         for item in items {
@@ -861,7 +1072,23 @@ pub fn assistant_parts_from_anthropic(value: &Value) -> AssistantParts {
                             arguments: serde_json::to_string(&input)
                                 .unwrap_or_else(|_| "{}".to_string()),
                         },
+                        namespace: None,
                     });
+                }
+                "server_tool_use"
+                    if item.get("name").and_then(Value::as_str) == Some("web_search") =>
+                {
+                    let id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let query = item
+                        .pointer("/input/query")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    web_searches.push((id, query));
                 }
                 _ => {}
             }
@@ -899,6 +1126,20 @@ pub fn assistant_parts_from_anthropic(value: &Value) -> AssistantParts {
             .and_then(Value::as_str)
             .unwrap_or(DEFAULT_OPENAI_COMPAT_MODEL)
             .to_string(),
+        web_searches,
+        reasoning_tokens: usage
+            .get("reasoning_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        credit_usage: usage.get("credit_usage").and_then(Value::as_f64),
+        credit_unit: usage
+            .get("credit_unit")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        credit_unit_plural: usage
+            .get("credit_unit_plural")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     }
 }
 
@@ -931,7 +1172,7 @@ pub fn chat_message_from_parts(parts: &AssistantParts) -> Value {
 
 pub fn usage_json(parts: &AssistantParts) -> Value {
     let prompt_tokens = parts.input_tokens + parts.cache_creation_tokens + parts.cache_read_tokens;
-    json!({
+    let mut usage = json!({
         "prompt_tokens": prompt_tokens,
         "completion_tokens": parts.output_tokens,
         "total_tokens": prompt_tokens + parts.output_tokens,
@@ -939,9 +1180,11 @@ pub fn usage_json(parts: &AssistantParts) -> Value {
             "cached_tokens": parts.cache_read_tokens,
         },
         "completion_tokens_details": {
-            "reasoning_tokens": 0,
+            "reasoning_tokens": parts.reasoning_tokens,
         }
-    })
+    });
+    append_credit_usage(&mut usage, parts);
+    usage
 }
 
 /// Responses API 口径的 usage。
@@ -952,17 +1195,31 @@ pub fn usage_json(parts: &AssistantParts) -> Value {
 /// 口径的 usage，反序列化会失败并中断整条流，所以必须单独构造。
 pub fn responses_usage_json(parts: &AssistantParts) -> Value {
     let input_tokens = parts.input_tokens + parts.cache_creation_tokens + parts.cache_read_tokens;
-    json!({
+    let mut usage = json!({
         "input_tokens": input_tokens,
         "input_tokens_details": {
             "cached_tokens": parts.cache_read_tokens,
         },
         "output_tokens": parts.output_tokens,
         "output_tokens_details": {
-            "reasoning_tokens": 0,
+            "reasoning_tokens": parts.reasoning_tokens,
         },
         "total_tokens": input_tokens + parts.output_tokens,
-    })
+    });
+    append_credit_usage(&mut usage, parts);
+    usage
+}
+
+fn append_credit_usage(usage: &mut Value, parts: &AssistantParts) {
+    if let Some(value) = parts.credit_usage {
+        usage["credit_usage"] = json!(value);
+    }
+    if let Some(value) = &parts.credit_unit {
+        usage["credit_unit"] = json!(value);
+    }
+    if let Some(value) = &parts.credit_unit_plural {
+        usage["credit_unit_plural"] = json!(value);
+    }
 }
 
 pub fn openai_error(message: impl Into<String>, error_type: impl Into<String>) -> Value {
@@ -987,8 +1244,34 @@ pub fn assistant_message_for_history(parts: &AssistantParts) -> OpenAIMessage {
 }
 
 pub fn response_output_from_parts(parts: &AssistantParts) -> (Vec<Value>, String) {
+    response_output_from_parts_with_tools(parts, &ToolKindMap::new())
+}
+
+pub fn response_output_from_parts_with_tools(
+    parts: &AssistantParts,
+    tool_kinds: &ToolKindMap,
+) -> (Vec<Value>, String) {
     let mut output = Vec::new();
-    if !parts.text.is_empty() || parts.tool_calls.is_empty() {
+    if !parts.reasoning.is_empty() {
+        output.push(json!({
+            "id": format!("rs_{}", uuid::Uuid::new_v4().simple()),
+            "type": "reasoning",
+            "summary": [{
+                "type": "summary_text",
+                "text": parts.reasoning,
+            }],
+            "content": null,
+        }));
+    }
+    for (id, query) in &parts.web_searches {
+        output.push(json!({
+            "id": id,
+            "type": "web_search_call",
+            "status": "completed",
+            "action": { "type": "search", "query": query },
+        }));
+    }
+    if !parts.text.is_empty() {
         output.push(json!({
             "id": format!("msg_{}", uuid::Uuid::new_v4().simple()),
             "type": "message",
@@ -1001,26 +1284,65 @@ pub fn response_output_from_parts(parts: &AssistantParts) -> (Vec<Value>, String
             }]
         }));
     }
-    if !parts.reasoning.is_empty() {
-        output.push(json!({
-            "id": format!("rs_{}", uuid::Uuid::new_v4().simple()),
-            "type": "reasoning",
-            "summary": [],
-            "content": [{
-                "type": "reasoning_text",
-                "text": parts.reasoning,
-            }],
-        }));
-    }
     for call in &parts.tool_calls {
-        output.push(json!({
-            "id": format!("fc_{}", uuid::Uuid::new_v4().simple()),
-            "type": "function_call",
-            "status": "completed",
-            "call_id": call.id.clone().unwrap_or_default(),
-            "name": call.function.name,
-            "arguments": call.function.arguments,
-        }));
+        output.push(response_tool_item(call, tool_kinds, "completed"));
     }
     (output, parts.text.clone())
+}
+
+pub fn response_tool_item(
+    call: &OpenAIToolCall,
+    tool_kinds: &ToolKindMap,
+    status: &str,
+) -> Value {
+    let declared = tool_kinds.get(&call.function.name);
+    let kind = declared
+        .map(|declared| declared.kind)
+        .unwrap_or(DeclaredToolKind::Function);
+    let name = declared
+        .map(|declared| declared.name.as_str())
+        .unwrap_or(call.function.name.as_str());
+    let namespace = declared.and_then(|declared| declared.namespace.as_deref());
+    let item_id = match kind {
+        DeclaredToolKind::Function => format!("fc_{}", uuid::Uuid::new_v4().simple()),
+        DeclaredToolKind::Custom => format!("ctc_{}", uuid::Uuid::new_v4().simple()),
+    };
+    let mut item = match kind {
+        DeclaredToolKind::Function => json!({
+            "id": item_id,
+            "type": "function_call",
+            "status": status,
+            "call_id": call.id.clone().unwrap_or_default(),
+            "name": name,
+            "arguments": call.function.arguments,
+        }),
+        DeclaredToolKind::Custom => json!({
+            "id": item_id,
+            "type": "custom_tool_call",
+            "status": status,
+            "call_id": call.id.clone().unwrap_or_default(),
+            "name": name,
+            "input": custom_input_text(&call.function.arguments),
+        }),
+    };
+    if let Some(namespace) = namespace {
+        item["namespace"] = Value::String(namespace.to_string());
+    }
+    item
+}
+
+pub fn custom_input_text(arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(arguments) else {
+        return arguments.to_string();
+    };
+    if let Some(input) = value.get("input").and_then(Value::as_str) {
+        return input.to_string();
+    }
+    if let Some(object) = value.as_object()
+        && object.len() == 1
+        && let Some(value) = object.values().next().and_then(Value::as_str)
+    {
+        return value.to_string();
+    }
+    arguments.to_string()
 }

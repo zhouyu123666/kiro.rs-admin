@@ -1,10 +1,15 @@
-use std::{collections::HashMap, convert::Infallible, sync::OnceLock};
+use std::{
+    cell::Cell,
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    sync::OnceLock,
+};
 
 use axum::{
     Json as JsonExtractor,
     body::{Body, to_bytes},
     extract::{Extension, Path, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -19,9 +24,10 @@ use crate::anthropic::{
 
 use super::types::{
     AssistantParts, ChatCompletionRequest, OpenAIConversionError, OpenAIFunctionCall,
-    OpenAIMessage, OpenAIToolCall, ResponsesRequest, assistant_message_for_history,
-    assistant_parts_from_anthropic, chat_message_from_parts, chat_to_anthropic,
-    finish_reason_from_anthropic, openai_error, response_output_from_parts, responses_to_chat_request,
+    OpenAIMessage, OpenAIToolCall, ResponsesRequest, ToolKindMap,
+    assistant_message_for_history, assistant_parts_from_anthropic, chat_message_from_parts,
+    chat_to_anthropic_with_metadata, finish_reason_from_anthropic, openai_error,
+    response_output_from_parts_with_tools, response_tool_item, responses_to_chat_request,
     responses_usage_json, usage_json,
 };
 
@@ -44,14 +50,16 @@ fn responses_store() -> &'static RwLock<HashMap<String, StoredResponse>> {
 pub async fn post_chat_completions(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     JsonExtractor(mut req): JsonExtractor<ChatCompletionRequest>,
 ) -> Response {
     apply_model_mapping(&state, &mut req.model);
+    let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &headers);
     let include_usage = req
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage);
-    let converted = match chat_to_anthropic(&req) {
+    let converted = match chat_to_anthropic_with_metadata(&req, metadata) {
         Ok(converted) => converted,
         Err(e) => return conversion_error(e),
     };
@@ -76,11 +84,14 @@ pub async fn post_chat_completions(
 pub async fn post_responses(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     JsonExtractor(mut req): JsonExtractor<ResponsesRequest>,
 ) -> Response {
     if let Some(model) = req.model.as_mut() {
         apply_model_mapping(&state, model);
     }
+    let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &headers);
+    let response_config = ResponsesResponseConfig::from_request(&req);
     let previous_messages = match load_previous_messages(req.previous_response_id.as_deref()) {
         Ok(messages) => messages,
         Err(resp) => return resp,
@@ -89,7 +100,7 @@ pub async fn post_responses(
         Ok(req) => req,
         Err(e) => return conversion_error(e),
     };
-    let converted = match chat_to_anthropic(&chat_req) {
+    let converted = match chat_to_anthropic_with_metadata(&chat_req, metadata) {
         Ok(converted) => converted,
         Err(e) => return conversion_error(e),
     };
@@ -100,6 +111,7 @@ pub async fn post_responses(
     let stream = converted.anthropic.stream;
     let model = converted.anthropic.model.clone();
     let messages_for_history = converted.openai_messages.clone();
+    let tool_kinds = converted.tool_kinds.clone();
 
     let anthropic_response = post_messages(
         State(state),
@@ -119,6 +131,8 @@ pub async fn post_responses(
                 metadata: req.metadata.clone(),
                 store_response,
                 messages_for_history,
+                tool_kinds,
+                response_config,
             },
         )
         .await
@@ -131,8 +145,64 @@ pub async fn post_responses(
             req.metadata.clone(),
             store_response,
             messages_for_history,
+            tool_kinds,
+            response_config,
         )
         .await
+    }
+}
+
+fn resolve_session_metadata(
+    prompt_cache_key: Option<&str>,
+    headers: &HeaderMap,
+) -> Option<crate::anthropic::types::Metadata> {
+    let candidates = [
+        prompt_cache_key,
+        headers
+            .get("x-session-affinity")
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get("x-client-request-id")
+            .and_then(|value| value.to_str().ok()),
+        headers.get("session_id").and_then(|value| value.to_str().ok()),
+    ];
+    candidates.into_iter().flatten().find_map(|candidate| {
+        let raw_uuid = candidate.strip_prefix("session_").unwrap_or(candidate);
+        let uuid = uuid::Uuid::parse_str(raw_uuid).ok()?;
+        Some(crate::anthropic::types::Metadata {
+            user_id: Some(format!("session_{uuid}")),
+        })
+    })
+}
+
+#[derive(Clone)]
+struct ResponsesResponseConfig {
+    parallel_tool_calls: bool,
+    tool_choice: Value,
+    tools: Vec<Value>,
+}
+
+impl ResponsesResponseConfig {
+    fn from_request(req: &ResponsesRequest) -> Self {
+        let mut tools = req
+            .tools
+            .iter()
+            .filter_map(|tool| serde_json::to_value(tool).ok())
+            .collect::<Vec<_>>();
+        if let Some(Value::Array(items)) = &req.input {
+            for item in items {
+                if item.get("type").and_then(Value::as_str) == Some("additional_tools")
+                    && let Some(extra) = item.get("tools").and_then(Value::as_array)
+                {
+                    tools.extend(extra.iter().cloned());
+                }
+            }
+        }
+        Self {
+            parallel_tool_calls: req.parallel_tool_calls,
+            tool_choice: req.tool_choice.clone().unwrap_or_else(|| json!("auto")),
+            tools,
+        }
     }
 }
 
@@ -244,6 +314,8 @@ async fn convert_responses_non_stream_response(
     metadata: Option<Value>,
     store_response: bool,
     mut messages_for_history: Vec<OpenAIMessage>,
+    tool_kinds: ToolKindMap,
+    response_config: ResponsesResponseConfig,
 ) -> Response {
     let status = response.status();
     let body = response.into_body();
@@ -262,6 +334,9 @@ async fn convert_responses_non_stream_response(
         previous_response_id,
         metadata,
         &parts,
+        &tool_kinds,
+        &response_config,
+        "completed",
     );
 
     messages_for_history.push(assistant_message_for_history(&parts));
@@ -340,6 +415,8 @@ struct ResponsesStreamMeta {
     metadata: Option<Value>,
     store_response: bool,
     messages_for_history: Vec<OpenAIMessage>,
+    tool_kinds: ToolKindMap,
+    response_config: ResponsesResponseConfig,
 }
 
 async fn convert_responses_stream_response(response: Response, meta: ResponsesStreamMeta) -> Response {
@@ -361,6 +438,8 @@ async fn convert_responses_stream_response(response: Response, meta: ResponsesSt
 trait AnthropicSseTranslator {
     fn handle_frame(&mut self, frame: SseFrame) -> Vec<Bytes>;
     fn finish(&mut self) -> Vec<Bytes>;
+    fn stream_error(&mut self, message: String) -> Vec<Bytes>;
+    fn is_terminal(&self) -> bool;
 }
 
 fn transform_anthropic_sse<T>(
@@ -386,6 +465,9 @@ where
                         for frame in frames {
                             out.extend(translator.handle_frame(frame).into_iter().map(Ok));
                         }
+                        if translator.is_terminal() {
+                            finished = true;
+                        }
                         if !out.is_empty() {
                             return Some((
                                 stream::iter(out),
@@ -395,14 +477,9 @@ where
                     }
                     Some(Err(e)) => {
                         finished = true;
-                        let bytes = chat_data_sse(json!({
-                            "error": {
-                                "message": format!("upstream stream error: {}", e),
-                                "type": "server_error",
-                            }
-                        }));
+                        let bytes = translator.stream_error(format!("upstream stream error: {e}"));
                         return Some((
-                            stream::iter(vec![Ok(bytes)]),
+                            stream::iter(bytes.into_iter().map(Ok).collect::<Vec<_>>()),
                             (data_stream, parser, translator, finished),
                         ));
                     }
@@ -667,6 +744,20 @@ impl AnthropicSseTranslator for ChatStreamTranslator {
         out.push(Bytes::from_static(b"data: [DONE]\n\n"));
         out
     }
+
+    fn stream_error(&mut self, message: String) -> Vec<Bytes> {
+        self.done = true;
+        vec![
+            chat_data_sse(json!({
+                "error": { "message": message, "type": "server_error" }
+            })),
+            Bytes::from_static(b"data: [DONE]\n\n"),
+        ]
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.done
+    }
 }
 
 struct ResponsesStreamTranslator {
@@ -683,6 +774,21 @@ struct ResponsesStreamTranslator {
     tools: HashMap<i64, ToolStreamAcc>,
     usage: Option<Value>,
     stop_reason: Option<String>,
+    saw_message_stop: bool,
+    sequence_number: Cell<i64>,
+    reasoning_started: bool,
+    reasoning_done: bool,
+    reasoning_item_id: String,
+    reasoning_output_index: Option<usize>,
+    reasoning_blocks: HashSet<i64>,
+    web_searches: HashMap<i64, WebSearchStreamAcc>,
+    completed_web_searches: Vec<(String, String)>,
+}
+
+struct WebSearchStreamAcc {
+    id: String,
+    query: String,
+    output_index: usize,
 }
 
 impl ResponsesStreamTranslator {
@@ -701,7 +807,24 @@ impl ResponsesStreamTranslator {
             tools: HashMap::new(),
             usage: None,
             stop_reason: None,
+            saw_message_stop: false,
+            sequence_number: Cell::new(0),
+            reasoning_started: false,
+            reasoning_done: false,
+            reasoning_item_id: format!("rs_{}", uuid::Uuid::new_v4().simple()),
+            reasoning_output_index: None,
+            reasoning_blocks: HashSet::new(),
+            web_searches: HashMap::new(),
+            completed_web_searches: Vec::new(),
         }
+    }
+
+    fn emit(&self, event: &str, mut payload: Value) -> Bytes {
+        payload["type"] = json!(event);
+        let sequence_number = self.sequence_number.get();
+        payload["sequence_number"] = json!(sequence_number);
+        self.sequence_number.set(sequence_number + 1);
+        responses_event_sse(event, payload)
     }
 
     fn created_response(&self, status: &str, output: Vec<Value>, output_text: &str) -> Value {
@@ -714,6 +837,9 @@ impl ResponsesStreamTranslator {
             "previous_response_id": self.meta.previous_response_id,
             "output": output,
             "output_text": output_text,
+            "parallel_tool_calls": self.meta.response_config.parallel_tool_calls,
+            "tool_choice": self.meta.response_config.tool_choice,
+            "tools": self.meta.response_config.tools,
         });
         if let Some(metadata) = &self.meta.metadata {
             response["metadata"] = metadata.clone();
@@ -729,17 +855,15 @@ impl ResponsesStreamTranslator {
         // 同时补发 response.in_progress：官方 Responses 流与 Kiro-Go 都在 created
         // 之后紧跟一条 in_progress，部分 OpenAI SDK 以此判定流已正常开始。
         vec![
-            responses_event_sse(
+            self.emit(
                 "response.created",
                 json!({
-                    "type": "response.created",
                     "response": self.created_response("in_progress", Vec::new(), ""),
                 }),
             ),
-            responses_event_sse(
+            self.emit(
                 "response.in_progress",
                 json!({
-                    "type": "response.in_progress",
                     "response": self.created_response("in_progress", Vec::new(), ""),
                 }),
             ),
@@ -752,10 +876,9 @@ impl ResponsesStreamTranslator {
             return out;
         }
         self.message_started = true;
-        out.push(responses_event_sse(
+        out.push(self.emit(
             "response.output_item.added",
             json!({
-                "type": "response.output_item.added",
                 "output_index": self.output_index,
                 "item": {
                     "id": self.message_item_id,
@@ -766,10 +889,9 @@ impl ResponsesStreamTranslator {
                 }
             }),
         ));
-        out.push(responses_event_sse(
+        out.push(self.emit(
             "response.content_part.added",
             json!({
-                "type": "response.content_part.added",
                 "item_id": self.message_item_id,
                 "output_index": self.output_index,
                 "content_index": 0,
@@ -800,20 +922,18 @@ impl ResponsesStreamTranslator {
         });
         self.output_index += 1;
         vec![
-            responses_event_sse(
+            self.emit(
                 "response.output_text.done",
                 json!({
-                    "type": "response.output_text.done",
                     "item_id": self.message_item_id,
                     "output_index": self.output_index - 1,
                     "content_index": 0,
                     "text": self.text,
                 }),
             ),
-            responses_event_sse(
+            self.emit(
                 "response.content_part.done",
                 json!({
-                    "type": "response.content_part.done",
                     "item_id": self.message_item_id,
                     "output_index": self.output_index - 1,
                     "content_index": 0,
@@ -824,13 +944,74 @@ impl ResponsesStreamTranslator {
                     }
                 }),
             ),
-            responses_event_sse(
+            self.emit(
                 "response.output_item.done",
                 json!({
-                    "type": "response.output_item.done",
                     "output_index": self.output_index - 1,
                     "item": item,
                 }),
+            ),
+        ]
+    }
+
+    fn emit_reasoning_delta(&mut self, delta: &str) -> Vec<Bytes> {
+        if delta.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if !self.reasoning_started {
+            self.reasoning_started = true;
+            self.reasoning_output_index = Some(self.output_index);
+            self.output_index += 1;
+            out.push(self.emit(
+                "response.output_item.added",
+                json!({
+                    "output_index": self.reasoning_output_index,
+                    "item": {
+                        "id": self.reasoning_item_id,
+                        "type": "reasoning",
+                        "summary": [],
+                    }
+                }),
+            ));
+        }
+        self.reasoning.push_str(delta);
+        out.push(self.emit(
+            "response.reasoning_summary_text.delta",
+            json!({
+                "item_id": self.reasoning_item_id,
+                "output_index": self.reasoning_output_index,
+                "summary_index": 0,
+                "delta": delta,
+            }),
+        ));
+        out
+    }
+
+    fn close_reasoning(&mut self) -> Vec<Bytes> {
+        if !self.reasoning_started || self.reasoning_done {
+            return Vec::new();
+        }
+        self.reasoning_done = true;
+        let item = json!({
+            "id": self.reasoning_item_id,
+            "type": "reasoning",
+            "summary": [{ "type": "summary_text", "text": self.reasoning }],
+            "content": null,
+        });
+        vec![
+            self.emit(
+                "response.reasoning_summary_text.done",
+                json!({
+                    "item_id": self.reasoning_item_id,
+                    "output_index": self.reasoning_output_index,
+                    "summary_index": 0,
+                    "text": self.reasoning,
+                }),
+            ),
+            self.emit(
+                "response.output_item.done",
+                json!({ "output_index": self.reasoning_output_index, "item": item }),
             ),
         ]
     }
@@ -846,34 +1027,94 @@ impl AnthropicSseTranslator for ResponsesStreamTranslator {
             Err(_) => return Vec::new(),
         };
 
-        match frame.event.as_str() {
-            "message_start" => self.ensure_created(),
+        let mut prefixed = Vec::new();
+        if let Some(thinking) = data
+            .get("kiro_thinking")
+            .and_then(Value::as_str)
+            .filter(|thinking| !thinking.is_empty())
+        {
+            prefixed.extend(self.ensure_created());
+            prefixed.extend(self.emit_reasoning_delta(thinking));
+            prefixed.extend(self.close_reasoning());
+        }
+
+        let translated = match frame.event.as_str() {
+            "message_start" => {
+                if let Some(usage) = data.pointer("/message/usage") {
+                    self.usage = Some(merge_usage(self.usage.take(), usage));
+                }
+                self.ensure_created()
+            }
             "content_block_start" => {
-                if data
+                let block_index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
+                let block_type = data
                     .pointer("/content_block/type")
                     .and_then(Value::as_str)
-                    == Some("tool_use")
-                {
-                    let block_index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
-                    self.tools.insert(
-                        block_index,
-                        ToolStreamAcc {
-                            id: data
-                                .pointer("/content_block/id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            name: data
-                                .pointer("/content_block/name")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            args: String::new(),
-                            index: self.output_index,
-                        },
-                    );
+                    .unwrap_or_default();
+                match block_type {
+                    "tool_use" => {
+                        self.tools.insert(
+                            block_index,
+                            ToolStreamAcc {
+                                id: data
+                                    .pointer("/content_block/id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                name: data
+                                    .pointer("/content_block/name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                args: String::new(),
+                                index: self.output_index,
+                            },
+                        );
+                        Vec::new()
+                    }
+                    "thinking" => {
+                        self.reasoning_blocks.insert(block_index);
+                        Vec::new()
+                    }
+                    "server_tool_use"
+                        if data.pointer("/content_block/name").and_then(Value::as_str)
+                            == Some("web_search") =>
+                    {
+                        let id = data
+                            .pointer("/content_block/id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let query = data
+                            .pointer("/content_block/input/query")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let output_index = self.output_index;
+                        self.output_index += 1;
+                        self.web_searches.insert(
+                            block_index,
+                            WebSearchStreamAcc {
+                                id: id.clone(),
+                                query: query.clone(),
+                                output_index,
+                            },
+                        );
+                        vec![self.emit(
+                            "response.output_item.added",
+                            json!({
+                                "output_index": output_index,
+                                "item": {
+                                    "id": id,
+                                    "type": "web_search_call",
+                                    "status": "in_progress",
+                                    "action": { "type": "search", "query": query },
+                                }
+                            }),
+                        )]
+                    }
+                    _ => Vec::new(),
                 }
-                Vec::new()
             }
             "content_block_delta" => match data.pointer("/delta/type").and_then(Value::as_str) {
                 Some("text_delta") => {
@@ -882,10 +1123,9 @@ impl AnthropicSseTranslator for ResponsesStreamTranslator {
                         && !delta.is_empty()
                     {
                         self.text.push_str(delta);
-                        out.push(responses_event_sse(
+                        out.push(self.emit(
                             "response.output_text.delta",
                             json!({
-                                "type": "response.output_text.delta",
                                 "item_id": self.message_item_id,
                                 "output_index": self.output_index,
                                 "content_index": 0,
@@ -896,10 +1136,11 @@ impl AnthropicSseTranslator for ResponsesStreamTranslator {
                     out
                 }
                 Some("thinking_delta") => {
-                    if let Some(delta) = data.pointer("/delta/thinking").and_then(Value::as_str) {
-                        self.reasoning.push_str(delta);
-                    }
-                    Vec::new()
+                    let delta = data
+                        .pointer("/delta/thinking")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    self.emit_reasoning_delta(delta)
                 }
                 Some("input_json_delta") => {
                     let index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
@@ -915,6 +1156,27 @@ impl AnthropicSseTranslator for ResponsesStreamTranslator {
             },
             "content_block_stop" => {
                 let index = data.get("index").and_then(Value::as_i64).unwrap_or(0);
+                if self.reasoning_blocks.remove(&index) {
+                    prefixed.extend(self.close_reasoning());
+                    return prefixed;
+                }
+                if let Some(search) = self.web_searches.remove(&index) {
+                    let id = search.id;
+                    let query = search.query;
+                    let item = json!({
+                        "id": id,
+                        "type": "web_search_call",
+                        "status": "completed",
+                        "action": { "type": "search", "query": query },
+                    });
+                    self.completed_web_searches
+                        .push((id.clone(), query.clone()));
+                    prefixed.push(self.emit(
+                        "response.output_item.done",
+                        json!({ "output_index": search.output_index, "item": item }),
+                    ));
+                    return prefixed;
+                }
                 let Some(tool) = self.tools.remove(&index) else {
                     return Vec::new();
                 };
@@ -926,59 +1188,83 @@ impl AnthropicSseTranslator for ResponsesStreamTranslator {
                         name: tool.name.clone(),
                         arguments: tool.args.clone(),
                     },
+                    namespace: None,
+                };
+                let item = response_tool_item(&call, &self.meta.tool_kinds, "completed");
+                let item_type = item.get("type").and_then(Value::as_str).unwrap_or("function_call");
+                let item_id = item.get("id").cloned().unwrap_or(Value::Null);
+                let added_item = match item_type {
+                    "custom_tool_call" => {
+                        let mut added = item.clone();
+                        added["status"] = json!("in_progress");
+                        added
+                    }
+                    _ => {
+                        let mut added = item.clone();
+                        added["status"] = json!("in_progress");
+                        added["arguments"] = json!("");
+                        added
+                    }
                 };
                 self.tool_calls.push(call);
-                let item = json!({
-                    "id": format!("fc_{}", uuid::Uuid::new_v4().simple()),
-                    "type": "function_call",
-                    "status": "completed",
-                    "call_id": tool.id,
-                    "name": tool.name,
-                    "arguments": tool.args,
-                });
-                out.extend([
-                    responses_event_sse(
+                out.push(
+                    self.emit(
                         "response.output_item.added",
                         json!({
-                            "type": "response.output_item.added",
                             "output_index": self.output_index,
-                            "item": {
-                                "id": item["id"],
-                                "type": "function_call",
-                                "status": "in_progress",
-                                "call_id": item["call_id"],
-                                "name": item["name"],
-                                "arguments": "",
-                            }
+                            "item": added_item,
                         }),
-                    ),
-                    responses_event_sse(
+                    )
+                );
+                if item_type == "custom_tool_call" {
+                    let input = item.get("input").cloned().unwrap_or(json!(""));
+                    out.extend([
+                        self.emit(
+                            "response.custom_tool_call_input.delta",
+                            json!({
+                                "item_id": item_id,
+                                "output_index": self.output_index,
+                                "delta": input,
+                            }),
+                        ),
+                        self.emit(
+                            "response.custom_tool_call_input.done",
+                            json!({
+                                "item_id": item_id,
+                                "output_index": self.output_index,
+                                "input": input,
+                            }),
+                        ),
+                    ]);
+                } else {
+                    out.extend([
+                    self.emit(
                         "response.function_call_arguments.delta",
                         json!({
-                            "type": "response.function_call_arguments.delta",
-                            "item_id": item["id"],
+                            "item_id": item_id,
                             "output_index": self.output_index,
                             "delta": item["arguments"],
                         }),
                     ),
-                    responses_event_sse(
+                    self.emit(
                         "response.function_call_arguments.done",
                         json!({
-                            "type": "response.function_call_arguments.done",
-                            "item_id": item["id"],
+                            "item_id": item_id,
                             "output_index": self.output_index,
                             "arguments": item["arguments"],
                         }),
                     ),
-                    responses_event_sse(
+                    ]);
+                }
+                out.push(
+                    self.emit(
                         "response.output_item.done",
                         json!({
-                            "type": "response.output_item.done",
                             "output_index": self.output_index,
                             "item": item,
                         }),
-                    ),
-                ]);
+                    )
+                );
                 self.output_index += 1;
                 out
             }
@@ -989,17 +1275,21 @@ impl AnthropicSseTranslator for ResponsesStreamTranslator {
                     .map(str::to_string);
                 // 保存 Anthropic 原始 usage（未汇总的 input/cache 分量），
                 // 供 finish() 组装 Responses 口径时避免与 cache 重复相加。
-                self.usage = data.get("usage").cloned();
+                if let Some(usage) = data.get("usage") {
+                    self.usage = Some(merge_usage(self.usage.take(), usage));
+                }
                 Vec::new()
             }
-            "message_stop" => self.finish(),
+            "message_stop" => {
+                self.saw_message_stop = true;
+                self.finish()
+            }
             "error" => {
                 self.done = true;
                 let mut out = self.ensure_created();
-                out.push(responses_event_sse(
+                out.push(self.emit(
                     "response.failed",
                     json!({
-                        "type": "response.failed",
                         "response": {
                             "id": self.meta.response_id,
                             "object": "response",
@@ -1014,15 +1304,21 @@ impl AnthropicSseTranslator for ResponsesStreamTranslator {
                 out
             }
             _ => Vec::new(),
-        }
+        };
+        prefixed.extend(translated);
+        prefixed
     }
 
     fn finish(&mut self) -> Vec<Bytes> {
         if self.done {
             return Vec::new();
         }
+        if !self.saw_message_stop {
+            return self.stream_error("upstream stream ended before message_stop".to_string());
+        }
         self.done = true;
         let mut out = self.ensure_created();
+        out.extend(self.close_reasoning());
         out.extend(self.close_message());
 
         let parts = AssistantParts {
@@ -1055,13 +1351,45 @@ impl AnthropicSseTranslator for ResponsesStreamTranslator {
                 .and_then(Value::as_i64)
                 .unwrap_or_default(),
             model: self.meta.model.clone(),
+            web_searches: self.completed_web_searches.clone(),
+            reasoning_tokens: self
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.get("reasoning_tokens"))
+                .and_then(Value::as_i64)
+                .unwrap_or_default(),
+            credit_usage: self
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.get("credit_usage"))
+                .and_then(Value::as_f64),
+            credit_unit: self
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.get("credit_unit"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            credit_unit_plural: self
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.get("credit_unit_plural"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
         };
+        let incomplete = matches!(
+            self.stop_reason.as_deref(),
+            Some("max_tokens" | "model_context_window_exceeded")
+        );
+        let status = if incomplete { "incomplete" } else { "completed" };
         let response = build_responses_object(
             &self.meta.response_id,
             self.meta.created_at,
             self.meta.previous_response_id.clone(),
             self.meta.metadata.clone(),
             &parts,
+            &self.meta.tool_kinds,
+            &self.meta.response_config,
+            status,
         );
 
         if self.meta.store_response {
@@ -1070,15 +1398,35 @@ impl AnthropicSseTranslator for ResponsesStreamTranslator {
             save_response(self.meta.response_id.clone(), response.clone(), history);
         }
 
-        out.push(responses_event_sse(
-            "response.completed",
+        let event = if incomplete { "response.incomplete" } else { "response.completed" };
+        out.push(self.emit(
+            event,
             json!({
-                "type": "response.completed",
                 "response": response,
             }),
         ));
         out.push(Bytes::from_static(b"data: [DONE]\n\n"));
         out
+    }
+
+    fn stream_error(&mut self, message: String) -> Vec<Bytes> {
+        if self.done {
+            return Vec::new();
+        }
+        self.done = true;
+        let mut out = self.ensure_created();
+        let mut response = self.created_response("failed", Vec::new(), "");
+        response["error"] = json!({ "code": "server_error", "message": message });
+        out.push(self.emit(
+            "response.failed",
+            json!({ "response": response }),
+        ));
+        out.push(Bytes::from_static(b"data: [DONE]\n\n"));
+        out
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.done
     }
 }
 
@@ -1114,27 +1462,50 @@ fn usage_from_anthropic_delta(data: &Value) -> Value {
     })
 }
 
+fn merge_usage(current: Option<Value>, incoming: &Value) -> Value {
+    let mut merged = current.unwrap_or_else(|| json!({}));
+    let Some(target) = merged.as_object_mut() else {
+        return incoming.clone();
+    };
+    let Some(source) = incoming.as_object() else {
+        return merged;
+    };
+    for (key, value) in source {
+        target.insert(key.clone(), value.clone());
+    }
+    merged
+}
+
 fn build_responses_object(
     id: &str,
     created_at: i64,
     previous_response_id: Option<String>,
     metadata: Option<Value>,
     parts: &AssistantParts,
+    tool_kinds: &ToolKindMap,
+    response_config: &ResponsesResponseConfig,
+    status: &str,
 ) -> Value {
-    let (output, output_text) = response_output_from_parts(parts);
+    let (output, output_text) = response_output_from_parts_with_tools(parts, tool_kinds);
     let mut response = json!({
         "id": id,
         "object": "response",
         "created_at": created_at,
-        "status": "completed",
+        "status": status,
         "model": parts.model,
         "previous_response_id": previous_response_id,
         "output": output,
         "output_text": output_text,
         "usage": responses_usage_json(parts),
+        "parallel_tool_calls": response_config.parallel_tool_calls,
+        "tool_choice": response_config.tool_choice,
+        "tools": response_config.tools,
     });
     if let Some(metadata) = metadata {
         response["metadata"] = metadata;
+    }
+    if status == "incomplete" {
+        response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
     }
     response
 }
@@ -1177,12 +1548,13 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::super::types::{
-        ChatCompletionRequest, OpenAIMessage, ResponsesRequest, assistant_parts_from_anthropic,
-        chat_to_anthropic, responses_input_to_messages, responses_to_chat_request,
+        ChatCompletionRequest, DeclaredTool, DeclaredToolKind, OpenAIMessage, ResponsesRequest,
+        ToolKindMap, assistant_parts_from_anthropic, chat_to_anthropic,
+        responses_input_to_messages, responses_to_chat_request,
     };
     use super::{
-        AnthropicSseTranslator, ChatStreamTranslator, ResponsesStreamMeta,
-        ResponsesStreamTranslator, SseFrameParser,
+        AnthropicSseTranslator, ChatStreamTranslator, HeaderMap, ResponsesResponseConfig,
+        ResponsesStreamMeta, ResponsesStreamTranslator, SseFrameParser, resolve_session_metadata,
     };
 
     /// 把一段 Anthropic SSE 原文喂给 ChatStreamTranslator，收集其产出的
@@ -1231,6 +1603,14 @@ mod tests {
             metadata: None,
             store_response: false,
             messages_for_history: Vec::new(),
+            tool_kinds: ToolKindMap::new(),
+            response_config: ResponsesResponseConfig::from_request(
+                &serde_json::from_value(json!({
+                    "model": "claude-sonnet-4.5",
+                    "input": "test"
+                }))
+                .unwrap(),
+            ),
         };
         let mut translator = ResponsesStreamTranslator::new(meta);
         let mut parser = SseFrameParser::default();
@@ -1269,6 +1649,167 @@ mod tests {
             }
         }
         events
+    }
+
+    #[test]
+    fn gpt_5_6_responses_model_is_not_downgraded() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "input": "hello",
+            "reasoning": { "effort": "high" }
+        }))
+        .unwrap();
+        let chat = responses_to_chat_request(&req, Vec::new()).unwrap();
+        let converted = chat_to_anthropic(&chat).unwrap();
+        assert_eq!(converted.anthropic.model, "gpt-5.6-sol");
+        assert_eq!(converted.anthropic.output_config.unwrap().effort, "high");
+    }
+
+    #[test]
+    fn gpt_5_6_preserves_none_and_max_effort() {
+        for effort in ["none", "max"] {
+            let req: ResponsesRequest = serde_json::from_value(json!({
+                "model": "gpt-5.6-terra",
+                "input": "hello",
+                "reasoning": { "effort": effort }
+            }))
+            .unwrap();
+            let chat = responses_to_chat_request(&req, Vec::new()).unwrap();
+            let converted = chat_to_anthropic(&chat).unwrap();
+            assert_eq!(
+                converted.anthropic.output_config.unwrap().effort,
+                effort
+            );
+        }
+    }
+
+    #[test]
+    fn responses_custom_and_namespace_tools_round_trip() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6-sol",
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [
+                        {"type": "custom", "name": "apply_patch"},
+                        {
+                            "type": "namespace",
+                            "name": "collaboration",
+                            "tools": [{"type": "function", "name": "spawn_agent", "parameters": {"type": "object"}}]
+                        }
+                    ]
+                },
+                {"type": "message", "role": "user", "content": "go"}
+            ]
+        }))
+        .unwrap();
+        let chat = responses_to_chat_request(&req, Vec::new()).unwrap();
+        let converted = chat_to_anthropic(&chat).unwrap();
+        let tools = converted.anthropic.tools.unwrap();
+        assert!(tools.iter().any(|tool| tool.name == "apply_patch"));
+        assert!(tools.iter().any(|tool| tool.name == "collaboration__spawn_agent"));
+        assert_eq!(
+            converted.tool_kinds["apply_patch"].kind,
+            DeclaredToolKind::Custom
+        );
+        assert_eq!(
+            converted.tool_kinds["collaboration__spawn_agent"]
+                .namespace
+                .as_deref(),
+            Some("collaboration")
+        );
+    }
+
+    #[test]
+    fn responses_custom_stream_emits_matching_item_type() {
+        let mut tool_kinds = ToolKindMap::new();
+        tool_kinds.insert(
+            "apply_patch".to_string(),
+            DeclaredTool {
+                kind: DeclaredToolKind::Custom,
+                name: "apply_patch".to_string(),
+                namespace: None,
+            },
+        );
+        let meta = ResponsesStreamMeta {
+            response_id: "resp_custom".to_string(),
+            created_at: 1,
+            model: "gpt-5.6-sol".to_string(),
+            previous_response_id: None,
+            metadata: None,
+            store_response: false,
+            messages_for_history: Vec::new(),
+            tool_kinds,
+            response_config: ResponsesResponseConfig::from_request(
+                &serde_json::from_value(json!({"model": "gpt-5.6-sol", "input": "go"}))
+                    .unwrap(),
+            ),
+        };
+        let mut translator = ResponsesStreamTranslator::new(meta);
+        let upstream = concat!(
+            "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"apply_patch\"}}\n\n",
+            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"input\\\":\\\"PATCH\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"index\":0}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let mut parser = SseFrameParser::default();
+        let mut output = Vec::new();
+        for frame in parser.push(upstream.as_bytes()) {
+            output.extend(translator.handle_frame(frame));
+        }
+        let output = output
+            .iter()
+            .map(|bytes| String::from_utf8_lossy(bytes))
+            .collect::<String>();
+        assert!(output.contains("custom_tool_call"));
+        assert!(output.contains("response.custom_tool_call_input.done"));
+        assert!(output.contains("PATCH"));
+        assert!(!output.contains("function_call_arguments.delta"));
+    }
+
+    #[test]
+    fn responses_early_eof_is_failed_not_completed() {
+        let meta = ResponsesStreamMeta {
+            response_id: "resp_eof".to_string(),
+            created_at: 1,
+            model: "gpt-5.6-sol".to_string(),
+            previous_response_id: None,
+            metadata: None,
+            store_response: false,
+            messages_for_history: Vec::new(),
+            tool_kinds: ToolKindMap::new(),
+            response_config: ResponsesResponseConfig::from_request(
+                &serde_json::from_value(json!({"model": "gpt-5.6-sol", "input": "go"}))
+                    .unwrap(),
+            ),
+        };
+        let mut translator = ResponsesStreamTranslator::new(meta);
+        let output = translator
+            .finish()
+            .iter()
+            .map(|bytes| String::from_utf8_lossy(bytes))
+            .collect::<String>();
+        assert!(output.contains("response.failed"));
+        assert!(!output.contains("response.completed"));
+    }
+
+    #[test]
+    fn session_metadata_prefers_prompt_cache_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-session-affinity",
+            "67e55044-10b1-426f-9247-bb680e5fe0c8".parse().unwrap(),
+        );
+        let metadata = resolve_session_metadata(
+            Some("550e8400-e29b-41d4-a716-446655440000"),
+            &headers,
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.user_id.as_deref(),
+            Some("session_550e8400-e29b-41d4-a716-446655440000")
+        );
     }
 
     #[test]
@@ -1513,7 +2054,19 @@ mod tests {
                 "cache_creation_input_tokens": 3
             }
         }));
-        let obj = super::build_responses_object("resp_1", 123, None, None, &parts);
+        let obj = super::build_responses_object(
+            "resp_1",
+            123,
+            None,
+            None,
+            &parts,
+            &ToolKindMap::new(),
+            &ResponsesResponseConfig::from_request(
+                &serde_json::from_value(json!({"model": "gpt-5.6-sol", "input": "hi"}))
+                    .unwrap(),
+            ),
+            "completed",
+        );
         let usage = &obj["usage"];
         // Responses 口径字段必须存在
         assert_eq!(usage["input_tokens"], json!(15)); // 10 + 3 + 2
@@ -1540,7 +2093,19 @@ mod tests {
             ],
             "usage": {"input_tokens": 1, "output_tokens": 1}
         }));
-        let obj = super::build_responses_object("resp_2", 1, None, None, &parts);
+        let obj = super::build_responses_object(
+            "resp_2",
+            1,
+            None,
+            None,
+            &parts,
+            &ToolKindMap::new(),
+            &ResponsesResponseConfig::from_request(
+                &serde_json::from_value(json!({"model": "gpt-5.6-sol", "input": "hi"}))
+                    .unwrap(),
+            ),
+            "completed",
+        );
         let output = obj["output"].as_array().unwrap();
         let msg = output.iter().find(|i| i["type"] == "message").unwrap();
         assert_eq!(msg["role"], "assistant");
