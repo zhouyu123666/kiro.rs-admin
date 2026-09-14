@@ -11,7 +11,9 @@ use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
-use crate::kiro::model::requests::kiro::{AdditionalModelRequestFields, KiroOutputConfig};
+use crate::kiro::model::requests::kiro::{
+    AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig,
+};
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
@@ -232,6 +234,10 @@ fn strip_thinking_suffix(model: &str) -> &str {
 
 fn is_native_kiro_model(model_lower: &str) -> bool {
     model_lower == "auto"
+        || matches!(
+            model_lower,
+            "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+        )
         || model_lower.starts_with("deepseek-")
         || model_lower.starts_with("minimax-")
         || model_lower.starts_with("glm-")
@@ -369,6 +375,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
     let mapped = normalize_model_id(model);
     let model_lower = mapped.to_ascii_lowercase();
     match mapped.as_str() {
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => 272_000,
         "claude-sonnet-4.6" | "claude-sonnet-5" | "claude-opus-4.6" | "claude-opus-4.7"
         | "claude-opus-4.8" | "claude-opus-5" | "claude-fable-5" | "auto" => 1_000_000,
         "deepseek-3.2" => 164_000,
@@ -391,7 +398,17 @@ pub fn get_context_window_size(model: &str) -> i32 {
 /// 与 xhigh 能力一致，一并视为支持。其余（4.5 系、haiku、sonnet-4.8 等）保守视为
 /// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
 /// 若后续实测某模型 400，从这里去除即可。
+fn model_uses_gpt_reasoning_effort(model_id: &str) -> bool {
+    matches!(
+        model_id.to_ascii_lowercase().as_str(),
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    )
+}
+
 fn model_supports_native_reasoning(model_id: &str) -> bool {
+    if model_uses_gpt_reasoning_effort(model_id) {
+        return true;
+    }
     let m = model_id.to_ascii_lowercase();
     matches!(
         m.as_str(),
@@ -456,6 +473,7 @@ fn select_native_reasoning_effort(req: &MessagesRequest, model_id: &str) -> Stri
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffortTier {
+    None,
     Low,
     Medium,
     High,
@@ -466,6 +484,7 @@ enum EffortTier {
 impl EffortTier {
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
@@ -477,6 +496,7 @@ impl EffortTier {
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -509,7 +529,11 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
     // it with `Invalid additionalModelRequestFields`, so map to the nearest
     // lower tier instead of failing the request. Unknown/future models keep
     // recognized values intact to avoid maintaining a brittle full allow-list.
-    let normalized = if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
+    let normalized = if requested == EffortTier::None
+        && !model_uses_gpt_reasoning_effort(model_id)
+    {
+        EffortTier::High
+    } else if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
         EffortTier::High
     } else {
         requested
@@ -583,9 +607,17 @@ fn build_additional_model_request_fields(
     }
 
     let effort = select_native_reasoning_effort(req, model_id);
-    Some(AdditionalModelRequestFields {
-        output_config: Some(KiroOutputConfig { effort }),
-    })
+    if model_uses_gpt_reasoning_effort(model_id) {
+        Some(AdditionalModelRequestFields {
+            output_config: None,
+            reasoning: Some(KiroReasoningConfig { effort }),
+        })
+    } else {
+        Some(AdditionalModelRequestFields {
+            output_config: Some(KiroOutputConfig { effort }),
+            reasoning: None,
+        })
+    }
 }
 
 /// 转换结果
@@ -2141,6 +2173,19 @@ mod tests {
         assert_eq!(get_context_window_size("deepseek-3.2"), 164_000);
         assert_eq!(get_context_window_size("minimax-m2.5"), 196_000);
         assert_eq!(get_context_window_size("qwen3-coder-next"), 256_000);
+    }
+
+    #[test]
+    fn test_gpt_5_6_passthrough_context_and_effort_wire() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(map_model(model).as_deref(), Some(model));
+            assert_eq!(get_context_window_size(model), 272_000);
+
+            let request = minimal_request_with_effort(model, "xhigh");
+            let fields = build_additional_model_request_fields(&request, model).unwrap();
+            assert!(fields.output_config.is_none());
+            assert_eq!(fields.reasoning.as_ref().unwrap().effort, "xhigh");
+        }
     }
 
     #[test]

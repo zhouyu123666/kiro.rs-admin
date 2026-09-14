@@ -441,6 +441,9 @@ fn available_models() -> Vec<Model> {
 
     let mut models = vec![
         model("auto", "Auto", "kiro", 64000),
+        model("gpt-5.6-sol", "GPT-5.6 Sol", "openai", 64000),
+        model("gpt-5.6-terra", "GPT-5.6 Terra", "openai", 64000),
+        model("gpt-5.6-luna", "GPT-5.6 Luna", "openai", 64000),
         model("claude-sonnet-5", "Claude Sonnet 5", "anthropic", 64000),
         model("claude-opus-4.8", "Claude Opus 4.8", "anthropic", 64000),
         model("claude-opus-4.7", "Claude Opus 4.7", "anthropic", 64000),
@@ -2288,6 +2291,15 @@ mod tests {
         assert!(ids.contains(&"qwen3-coder-next"));
         assert!(ids.contains(&"claude-sonnet-4.6"));
         assert!(ids.contains(&"claude-opus-4.8"));
+    }
+
+    #[test]
+    fn available_models_include_gpt_5_6_family() {
+        let ids: std::collections::HashSet<_> =
+            available_models().into_iter().map(|model| model.id).collect();
+        for id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert!(ids.contains(id), "missing {id}");
+        }
     }
 
     #[test]
