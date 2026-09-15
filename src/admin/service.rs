@@ -669,6 +669,10 @@ impl AdminService {
                     email: entry.email,
                     user_id: balance.and_then(|b| b.user_id.clone()),
                     enabled: !entry.disabled,
+                    groups: entry.groups,
+                    source_channel: entry.source_channel,
+                    rpm_limit: entry.rpm_limit,
+                    rpm_current: entry.rpm_current,
                     subscription_type: balance.and_then(|b| b.subscription_type.clone()).or_else(
                         || {
                             balance

@@ -420,6 +420,14 @@ pub struct AccountUsageItem {
     pub email: Option<String>,
     pub user_id: Option<String>,
     pub enabled: bool,
+    /// 账号所属分组（可属于多个分组）
+    pub groups: Vec<String>,
+    /// 账号来源渠道（纯备注）；未设置时为 null
+    pub source_channel: Option<String>,
+    /// 每分钟请求数上限（0 = 不限速）
+    pub rpm_limit: u32,
+    /// 当前滑动窗口内已用请求条数
+    pub rpm_current: u32,
     pub subscription_type: Option<String>,
     pub subscription_title: Option<String>,
     pub usage_current: f64,
@@ -1310,6 +1318,10 @@ mod tests {
                 email: Some("amy.joke@ever5d.com".to_string()),
                 user_id: Some("d-90667167fc.user-1".to_string()),
                 enabled: true,
+                groups: vec!["default".to_string(), "team".to_string()],
+                source_channel: Some("manual".to_string()),
+                rpm_limit: 10,
+                rpm_current: 3,
                 subscription_type: Some("POWER".to_string()),
                 subscription_title: Some("KIRO POWER".to_string()),
                 usage_current: 10_000.0,
@@ -1325,6 +1337,10 @@ mod tests {
         let account = &json["accounts"][0];
         assert_eq!(account["id"], "1");
         assert_eq!(account["userId"], "d-90667167fc.user-1");
+        assert_eq!(account["groups"], serde_json::json!(["default", "team"]));
+        assert_eq!(account["sourceChannel"], "manual");
+        assert_eq!(account["rpmLimit"], 10);
+        assert_eq!(account["rpmCurrent"], 3);
         assert_eq!(account["subscriptionType"], "POWER");
         assert_eq!(account["usageCurrent"], 10_000.0);
         assert_eq!(account["usagePercent"], 1.0);
