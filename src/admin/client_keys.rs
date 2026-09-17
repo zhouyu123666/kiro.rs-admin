@@ -458,12 +458,12 @@ impl ClientKeyManager {
 
     /// 校验 Key，命中且未禁用则返回 id；同时更新 `last_used_at`/`total_calls`
     ///
-    /// 用 `ConstantTimeEq` 对所有 active Key 做常量时间比对，防止时序攻击；
-    /// 之前的 HashMap 直接 lookup 仅作快速短路（命中后还会再做一次常量时间比较）。
+    /// 用 `ConstantTimeEq` 对所有 active Key 做常量时间比对，防止时序攻击。
+    ///
+    /// 注意：这里**不能**按 [`CLIENT_KEY_PREFIX`] 前缀短路。系统 Key 来自
+    /// `config.json` 的 `apiKey`，其前缀由用户自定义（默认 `sk-kiro-rs-`），
+    /// 按 `csk_` 过滤会让根密钥永远无法通过 `/v1` 鉴权。
     pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
-        if !presented.starts_with(CLIENT_KEY_PREFIX) {
-            return None;
-        }
         let mut inner = self.inner.write();
         // 第一遍：扫描所有 entry 做常量时间比较，避免 HashMap 短路泄露
         let mut hit_id: Option<u64> = None;
@@ -569,8 +569,18 @@ mod tests {
         let entry = mgr.create("test".to_string(), None, None);
         assert!(entry.key.starts_with(CLIENT_KEY_PREFIX));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
-        // 不带前缀的拒绝
+        // 未注册的明文拒绝
         assert_eq!(mgr.verify_and_touch("nope"), None);
+    }
+
+    /// 回归：系统 Key 前缀由 config.json 决定（默认 `sk-kiro-rs-`），
+    /// 校验不得按 `csk_` 前缀短路，否则根密钥调 /v1 永远 401。
+    #[test]
+    fn system_key_with_non_csk_prefix_verifies() {
+        let mgr = ClientKeyManager::new();
+        let plaintext = "sk-kiro-rs-e1SZjDCE4UYotLQAR7M0G9gH".to_string();
+        mgr.ensure_system_key("默认密钥".to_string(), None, plaintext.clone());
+        assert_eq!(mgr.verify_and_touch(&plaintext), Some(0));
     }
 
     #[test]
