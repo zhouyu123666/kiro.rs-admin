@@ -716,10 +716,15 @@ fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
 /// 为历史中使用但不在 tools 列表中的工具创建占位符定义
 /// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
 fn create_placeholder_tool(name: &str) -> Tool {
+    let description = if name == "kiro_compaction_history_tool" {
+        "Inert placeholder for structured tool calls in compacted history. Do not call it."
+    } else {
+        "Tool used in conversation history"
+    };
     Tool {
         tool_specification: ToolSpecification {
             name: name.to_string(),
-            description: "Tool used in conversation history".to_string(),
+            description: description.to_string(),
             input_schema: InputSchema::from_json(serde_json::json!({
                 "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "object",

@@ -90,6 +90,15 @@ pub async fn post_responses(
     if let Some(model) = req.model.as_mut() {
         apply_model_mapping(&state, model);
     }
+    let operation = match super::compaction::classify(req.input.as_ref()) {
+        Ok(operation) => operation,
+        Err(message) => {
+            return openai_status_error(StatusCode::BAD_REQUEST, "invalid_request_error", message);
+        }
+    };
+    if operation == super::compaction::Operation::RemoteCompact {
+        return super::compaction::handle(state, key_ctx, headers, req).await;
+    }
     let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &headers);
     let response_config = ResponsesResponseConfig::from_request(&req);
     let previous_messages = match load_previous_messages(req.previous_response_id.as_deref()) {
@@ -152,7 +161,7 @@ pub async fn post_responses(
     }
 }
 
-fn resolve_session_metadata(
+pub(super) fn resolve_session_metadata(
     prompt_cache_key: Option<&str>,
     headers: &HeaderMap,
 ) -> Option<crate::anthropic::types::Metadata> {
@@ -258,7 +267,9 @@ fn openai_status_error(
     (status, Json(openai_error(message, error_type))).into_response()
 }
 
-fn load_previous_messages(previous_response_id: Option<&str>) -> Result<Vec<OpenAIMessage>, Response> {
+pub(super) fn load_previous_messages(
+    previous_response_id: Option<&str>,
+) -> Result<Vec<OpenAIMessage>, Response> {
     let Some(id) = previous_response_id else {
         return Ok(Vec::new());
     };

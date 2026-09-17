@@ -348,8 +348,25 @@ fn response_input_item_to_messages(
     let role = obj.get("role").and_then(Value::as_str).unwrap_or_default();
 
     match typ {
-        "additional_tools" | "reasoning" | "web_search_call" | "compaction" => {
+        "additional_tools" | "reasoning" | "web_search_call" | "compaction_trigger" => {
             Ok(Vec::new())
+        }
+        "compaction" | "context_compaction" => {
+            let Some(summary) = obj
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .and_then(super::compaction::decode_payload)
+            else {
+                // A compaction blob minted by another provider is opaque here.
+                return Ok(Vec::new());
+            };
+            Ok(vec![OpenAIMessage {
+                role: "developer".to_string(),
+                content: Some(Value::String(super::compaction::restored_context(&summary))),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+            }])
         }
         "message" => {
             let role = if role.is_empty() { "user" } else { role };

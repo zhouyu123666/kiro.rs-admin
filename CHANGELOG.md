@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 🔧 修复 — Codex Remote Compaction v2
+
+- 识别 Responses input 末尾唯一的 `compaction_trigger`，让手动 `/compact` 与上下文阈值触发的自动压缩进入专用 Kiro 摘要路径，不再返回普通 `reasoning` / `message` 项并触发 `expected exactly one compaction output item`。
+- 流式与非流式成功响应均只返回一个 `type: "compaction"` output item；空摘要、工具调用、输出截断和上下文溢出分别返回明确的 failed / incomplete 结果。
+- 完整保留历史工具调用、参数、结果与配对关系；压缩打断的末尾工具调用补充取消结果，历史工具统一映射为不可执行占位工具。
+- 首次压缩始终使用完整历史；确认上下文溢出后，对历史工具结果按 25,000 字节总预算执行 UTF-8 安全裁剪并重试一次，合并两次尝试的 usage。
+- 使用与 ZyphrZero/kiro.rs PR #81 兼容的 `kiro-rs.compaction.v1:` payload，在下一轮恢复本服务生成的压缩摘要；其它服务的 opaque payload 保持忽略。
+
 ### 🔧 修复 — Claude 长会话短 token 无限复读
 
 - 复读熔断从 `call` / `count` 等固定工具引导词扩展到短原子行，覆盖截图中 `33` 这类退化输出。

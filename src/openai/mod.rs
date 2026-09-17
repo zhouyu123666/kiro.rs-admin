@@ -4,5 +4,6 @@
 //! Messages pipeline, so auth, usage accounting, tracing, Kiro retries, tool
 //! name mapping, image handling, and web-search routing stay in one place.
 
+mod compaction;
 pub(crate) mod handlers;
 mod types;
