@@ -238,11 +238,13 @@ curl http://127.0.0.1:8990/v1/messages/count_tokens \
 | 方法     | 路径                   | 说明                                                                                              |
 | -------- | ---------------------- | ------------------------------------------------------------------------------------------------- |
 | `POST`   | `/v1/chat/completions` | Chat Completions（文本 / 工具调用 / 流式 / WebSearch，供通用 OpenAI SDK 客户端）                  |
-| `POST`   | `/v1/responses`        | Responses API（Codex 接入的唯一端点；流式 SSE、工具调用、WebSearch、`previous_response_id` 多轮） |
+| `POST`   | `/v1/responses`        | Responses API（Codex 接入的唯一端点；流式 SSE、工具调用、WebSearch、`previous_response_id` 多轮、Remote Compaction v2） |
 | `GET`    | `/v1/responses/{id}`   | 获取已存储的 response（`store!=false` 时可用）                                                    |
 | `DELETE` | `/v1/responses/{id}`   | 删除已存储的 response                                                                             |
 
 接入 Codex：在 `~/.codex/config.toml` 配一个自定义 provider，`base_url` 指向 `http://<host>:<port>/v1`、`wire_api = "responses"`、`env_key` 填客户端 Key 对应的环境变量。Codex 会向 `base_url` + `/responses` 发起请求。请求里的 `gpt-*` / `o1` / `o3` / `codex` 等模型名会统一映射到默认兼容模型（`claude-sonnet-4.5`），也可直接填 Claude 模型名透传。带 `{"type":"web_search"}` 工具时，服务端内部执行联网搜索并把结果喂回模型合成答案（不向客户端下发原始搜索块）。
+
+Codex 手动执行 `/compact` 或达到上下文阈值时，服务会识别 Responses input 末尾唯一的 `compaction_trigger`，使用 Kiro 生成续接摘要，并按 Remote Compaction v2 协议返回唯一的 `compaction` output item；该摘要会在后续请求中恢复为先前对话上下文。
 
 ### Admin
 
