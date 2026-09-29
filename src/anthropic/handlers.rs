@@ -477,6 +477,24 @@ fn available_models() -> Vec<Model> {
             max_tokens: 64000,
         },
         Model {
+            id: "claude-opus-5.5".to_string(),
+            object: "model".to_string(),
+            created: 1784073600, // Jul 15, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-5.5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1784073600, // Jul 15, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
             id: "claude-opus-5".to_string(),
             object: "model".to_string(),
             created: 1784073600, // Jul 15, 2026
@@ -527,24 +545,6 @@ fn available_models() -> Vec<Model> {
             created: 1779897600, // May 28, 2026
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.8 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-8".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.8".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-8-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.8 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
@@ -2274,6 +2274,8 @@ mod tests {
         let models = available_models();
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
+        assert!(ids.contains(&"claude-opus-5.5"));
+        assert!(ids.contains(&"claude-opus-5.5-thinking"));
         assert!(ids.contains(&"claude-opus-5"));
         assert!(ids.contains(&"claude-opus-5-thinking"));
     }

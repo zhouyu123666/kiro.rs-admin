@@ -337,7 +337,9 @@ pub fn map_model(model: &str) -> Option<String> {
             None
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
+        if model_lower.contains("5-5") || model_lower.contains("5.5") {
+            Some("claude-opus-5.5".to_string())
+        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-opus-4.8".to_string())
         } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
             Some("claude-opus-4.7".to_string())
@@ -377,7 +379,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
     match mapped.as_str() {
         "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => 272_000,
         "claude-sonnet-4.6" | "claude-sonnet-5" | "claude-opus-4.6" | "claude-opus-4.7"
-        | "claude-opus-4.8" | "claude-opus-5" | "claude-fable-5" | "auto" => 1_000_000,
+        | "claude-opus-4.8" | "claude-opus-5" | "claude-opus-5.5" | "claude-fable-5"
+        | "auto" => 1_000_000,
         "deepseek-3.2" => 164_000,
         "minimax-m2.5" | "minimax-m2.1" => 196_000,
         "qwen3-coder-next" => 256_000,
@@ -2137,6 +2140,19 @@ mod tests {
             map_model("claude-opus-4-5-20251101"),
             Some("claude-opus-4.5".to_string())
         );
+    }
+
+    #[test]
+    fn test_map_model_opus_5_5() {
+        assert_eq!(
+            map_model("claude-opus-5.5"),
+            Some("claude-opus-5.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-5-thinking"),
+            Some("claude-opus-5.5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-opus-5.5"), 1_000_000);
     }
 
     #[test]
