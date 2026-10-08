@@ -428,7 +428,7 @@ impl RequestMetering {
     }
 }
 
-fn available_models() -> Vec<Model> {
+pub(crate) fn available_models() -> Vec<Model> {
     let model = |id: &str, display_name: &str, owned_by: &str, max_tokens: i32| Model {
         id: id.to_string(),
         object: "model".to_string(),
@@ -491,6 +491,60 @@ fn available_models() -> Vec<Model> {
             created: 1784073600, // Jul 15, 2026
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 5.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-5-5".to_string(),
+            object: "model".to_string(),
+            created: 1784073600, // Jul 15, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-5-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1784073600, // Jul 15, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-5-5".to_string(),
+            object: "model".to_string(),
+            created: 1784073600, // Jul 15, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-5-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1784073600, // Jul 15, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-haiku-5-5".to_string(),
+            object: "model".to_string(),
+            created: 1784073600, // Jul 15, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Haiku 5.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-haiku-5-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1784073600, // Jul 15, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Haiku 5.5 (Thinking)".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
@@ -665,11 +719,12 @@ fn available_models() -> Vec<Model> {
 
 /// GET /v1/models
 ///
-/// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+/// 返回可用的模型列表（自动同步 Kiro 上游 ListAvailableModels，带缓存）
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = available_models();
+    let token_manager = state.kiro_provider.as_ref().map(|p| p.token_manager());
+    let models = super::model_catalog::list_models(token_manager, available_models()).await;
 
     Json(ModelsResponse {
         object: "list".to_string(),
@@ -2281,6 +2336,23 @@ mod tests {
     }
 
     #[test]
+    fn available_models_include_5_5_family() {
+        let models = available_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+
+        for id in [
+            "claude-opus-5-5",
+            "claude-opus-5-5-thinking",
+            "claude-sonnet-5-5",
+            "claude-sonnet-5-5-thinking",
+            "claude-haiku-5-5",
+            "claude-haiku-5-5-thinking",
+        ] {
+            assert!(ids.contains(&id), "missing {id}");
+        }
+    }
+
+    #[test]
     fn available_models_include_native_kiro_models() {
         let models = available_models();
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
@@ -2372,16 +2444,5 @@ mod tests {
         .unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
-    }
-
-    #[test]
-    fn available_models_include_4_8_variants() {
-        let models = available_models();
-        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
-
-        assert!(ids.contains(&"claude-opus-4-8"));
-        assert!(ids.contains(&"claude-opus-4-8-thinking"));
-        assert!(ids.contains(&"claude-sonnet-4-8"));
-        assert!(ids.contains(&"claude-sonnet-4-8-thinking"));
     }
 }

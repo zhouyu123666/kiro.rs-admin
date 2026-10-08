@@ -185,6 +185,11 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
+    /// 获取多凭据 Token 管理器
+    pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
+        &self.token_manager
+    }
+
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
     ///
     /// # Arguments

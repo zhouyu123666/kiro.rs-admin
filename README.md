@@ -187,7 +187,7 @@ curl http://127.0.0.1:8990/cc/v1/messages \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-kiro-rs-..." \
   -d '{
-    "model": "claude-sonnet-4-8",
+    "model": "claude-sonnet-5",
     "max_tokens": 1024,
     "stream": true,
     "messages": [
@@ -471,18 +471,25 @@ Admin UI 的批量导入和 Account Manager 导入已经合并为同一个入口
 
 ## 模型
 
-`GET /v1/models` 返回本服务声明的兼容模型 ID。真实可用性仍取决于上游账号订阅；Admin 的“凭据模型”会实时调用 Kiro `ListAvailableModels` 查询该凭据实际可用模型列表，响应测试也可以直接使用这份列表。
+`GET /v1/models` 自动同步 Kiro `ListAvailableModels`（取第一个查询成功的可用凭据，进程内缓存 10 分钟）：
 
-当前声明列表包含常见 Claude 别名和 Kiro 原生模型：
+- 上游返回的 Claude 模型会把带点的版本号转成短横线形式，如 `claude-opus-5.5` → `claude-opus-5-5`，并补充对应 `-thinking` 变体；请求时会自动映射回上游 ID
+- 下方内置列表中的别名仅在其映射目标出现在上游列表时保留
+- 上游查询失败时沿用上次缓存；从未成功时回退到下方内置列表
+
+真实可用性仍取决于上游账号订阅；Admin 的“凭据模型”会实时调用 Kiro `ListAvailableModels` 查询单个凭据实际可用模型列表，响应测试也可以直接使用这份列表。
+
+内置列表包含常见 Claude 别名和 Kiro 原生模型：
 
 - `auto`
 - `claude-sonnet-5` / `claude-sonnet-5-thinking`
 - `claude-opus-5.5` / `claude-opus-5.5-thinking`
+- `claude-opus-5-5`、`claude-sonnet-5-5`、`claude-haiku-5-5` 及对应 `-thinking`
 - `claude-opus-5` / `claude-opus-5-thinking`
 - `claude-opus-4.8`、`claude-opus-4.7`、`claude-opus-4.6`、`claude-opus-4.5`
 - `claude-sonnet-4.6`、`claude-sonnet-4.5`、`claude-sonnet-4`
 - `claude-haiku-4.5`
-- 兼容旧 Anthropic 风格别名：`claude-fable-5`、`claude-opus-4-8`、`claude-sonnet-4-8`、`claude-opus-4-5-20251101`、`claude-sonnet-4-5-20250929`、`claude-haiku-4-5-20251001` 及对应 `-thinking`
+- 兼容旧 Anthropic 风格别名：`claude-fable-5`、`claude-opus-4-8`、`claude-opus-4-5-20251101`、`claude-sonnet-4-5-20250929`、`claude-haiku-4-5-20251001` 及对应 `-thinking`
 - `deepseek-3.2`
 - `minimax-m2.5` / `minimax-m2.1`
 - `glm-5`
@@ -500,9 +507,9 @@ Admin UI 的批量导入和 Account Manager 导入已经合并为同一个入口
 | `claude-<family>-<major>-<minor>`                     | 自动归一化为 `claude-<family>-<major>.<minor>` |
 | `fable`（任意）                                       | `claude-fable-5`                               |
 | `sonnet` + `5`（`sonnet-5` / `sonnet5` / `sonnet.5`） | `claude-sonnet-5`                              |
-| `sonnet` + `4-8` / `4.8`                              | `claude-sonnet-4.8`                            |
 | `sonnet` + `4-6` / `4.6`                              | `claude-sonnet-4.6`                            |
 | `sonnet` + `4-5` / `4.5`                              | `claude-sonnet-4.5`                            |
+| `opus` + `5-5` / `5.5`                                | `claude-opus-5.5`                              |
 | `opus` + `4-8` / `4.8`                                | `claude-opus-4.8`                              |
 | `opus` + `4-7` / `4.7`                                | `claude-opus-4.7`                              |
 | `opus` + `4-6` / `4.6`                                | `claude-opus-4.6`                              |
@@ -531,7 +538,7 @@ Admin UI 的批量导入和 Account Manager 导入已经合并为同一个入口
 
 ```json
 {
-  "model": "claude-sonnet-4-8-thinking",
+  "model": "claude-sonnet-5-thinking",
   "max_tokens": 4096,
   "thinking": {
     "type": "enabled",
@@ -628,7 +635,7 @@ Kiro 历史消息只支持单一的 `content` 字符串，因此回放历史 ass
 
 ```json
 {
-  "model": "claude-sonnet-4-8",
+  "model": "claude-sonnet-5",
   "max_tokens": 2048,
   "stream": true,
   "tools": [
