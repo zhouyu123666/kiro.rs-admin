@@ -458,24 +458,37 @@ pub(crate) fn available_models() -> Vec<Model> {
         model("minimax-m2.1", "MiniMax M2.1", "minimax", 64000),
         model("glm-5", "GLM 5", "zhipu", 64000),
         model("qwen3-coder-next", "Qwen3 Coder Next", "qwen", 64000),
-        Model {
-            id: "claude-fable-5".to_string(),
-            object: "model".to_string(),
-            created: 1781481600, // Jun 15, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Fable 5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-fable-5-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1781481600, // Jun 15, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Fable 5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
+        // Fable 5.x：上游 ListAvailableModels 仅暴露 5.1 / 5.2；裸 claude-fable-5
+        // 已下线（请求会被判为 INVALID_MODEL_ID），故不再对外公布。
+        // 点号与短横线两种 ID 都列出，便于不同客户端直接选用。
+        model("claude-fable-5.1", "Claude Fable 5.1", "anthropic", 64000),
+        model(
+            "claude-fable-5.1-thinking",
+            "Claude Fable 5.1 (Thinking)",
+            "anthropic",
+            64000,
+        ),
+        model("claude-fable-5-1", "Claude Fable 5.1", "anthropic", 64000),
+        model(
+            "claude-fable-5-1-thinking",
+            "Claude Fable 5.1 (Thinking)",
+            "anthropic",
+            64000,
+        ),
+        model("claude-fable-5.2", "Claude Fable 5.2", "anthropic", 64000),
+        model(
+            "claude-fable-5.2-thinking",
+            "Claude Fable 5.2 (Thinking)",
+            "anthropic",
+            64000,
+        ),
+        model("claude-fable-5-2", "Claude Fable 5.2", "anthropic", 64000),
+        model(
+            "claude-fable-5-2-thinking",
+            "Claude Fable 5.2 (Thinking)",
+            "anthropic",
+            64000,
+        ),
         Model {
             id: "claude-opus-5.5".to_string(),
             object: "model".to_string(),
@@ -2350,6 +2363,28 @@ mod tests {
         ] {
             assert!(ids.contains(&id), "missing {id}");
         }
+    }
+
+    #[test]
+    fn available_models_include_fable_5_x() {
+        let models = available_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+
+        for id in [
+            "claude-fable-5.1",
+            "claude-fable-5.1-thinking",
+            "claude-fable-5-1",
+            "claude-fable-5-1-thinking",
+            "claude-fable-5.2",
+            "claude-fable-5.2-thinking",
+            "claude-fable-5-2",
+            "claude-fable-5-2-thinking",
+        ] {
+            assert!(ids.contains(&id), "missing {id}");
+        }
+        // 上游已下线的裸 ID 不再对外公布
+        assert!(!ids.contains(&"claude-fable-5"));
+        assert!(!ids.contains(&"claude-fable-5-thinking"));
     }
 
     #[test]

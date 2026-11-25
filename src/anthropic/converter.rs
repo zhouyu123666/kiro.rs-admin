@@ -286,6 +286,34 @@ fn normalize_claude_version_model(model_lower: &str) -> Option<String> {
     None
 }
 
+/// 上游下线裸 `claude-fable-5` 后的回退目标。
+///
+/// Kiro `ListAvailableModels` 当前只暴露 `claude-fable-5.1` / `claude-fable-5.2`，
+/// 裸 `claude-fable-5`（以及带日期的 `claude-fable-5-20261015`）会被上游判为
+/// `INVALID_MODEL_ID`，因此统一回落到仍可用的最低小版本。
+const FABLE_FALLBACK: &str = "claude-fable-5.1";
+
+/// 解析 Fable 版本号，返回规范化 ID（如 `claude-fable-5.1`）。
+///
+/// 同时接受点号（`claude-fable-5.1`）与短横线（`claude-fable-5-1`）两种写法。
+/// 小版本必须是 1~2 位数字，以免把 `claude-fable-5-20261015` 的日期后缀误判成
+/// 小版本。无法识别时返回 None，由调用方回落到 [`FABLE_FALLBACK`]。
+fn fable_dotted_version(model_lower: &str) -> Option<String> {
+    let parts: Vec<&str> = model_lower.split('-').collect();
+    let idx = parts.iter().position(|p| *p == "fable")?;
+    let is_num = |s: &str| (1..=2).contains(&s.len()) && s.chars().all(|c| c.is_ascii_digit());
+
+    // claude-fable-5.1 —— 点号写法
+    if let Some((major, minor)) = parts.get(idx + 1)?.split_once('.') {
+        return (is_num(major) && is_num(minor)).then(|| format!("claude-fable-{major}.{minor}"));
+    }
+
+    // claude-fable-5-1 —— 短横线写法
+    let major = *parts.get(idx + 1)?;
+    let minor = *parts.get(idx + 2)?;
+    (is_num(major) && is_num(minor)).then(|| format!("claude-fable-{major}.{minor}"))
+}
+
 fn claude_context_window(model_lower: &str) -> Option<i32> {
     let parts: Vec<&str> = model_lower.split('-').collect();
     let claude_idx = parts.iter().position(|part| *part == "claude")?;
@@ -336,8 +364,9 @@ pub fn map_model(model: &str) -> Option<String> {
     }
 
     if model_lower.contains("fable") {
-        // Fable 5：与 Mythos 5 同底座；目前仅 5 代
-        Some("claude-fable-5".to_string())
+        // Fable 5.x：识别出小版本（5.1 / 5-1 / 5.2 / 5-2）即按上游 ID 下发；
+        // 裸 claude-fable-5 与带日期的变体在上游已下线，回落到 FABLE_FALLBACK。
+        Some(fable_dotted_version(&model_lower).unwrap_or_else(|| FABLE_FALLBACK.to_string()))
     } else if model_lower.contains("sonnet") {
         if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
@@ -397,8 +426,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
     match mapped.as_str() {
         "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => 272_000,
         "claude-sonnet-4.6" | "claude-sonnet-5" | "claude-opus-4.6" | "claude-opus-4.7"
-        | "claude-opus-4.8" | "claude-opus-5" | "claude-opus-5.5" | "claude-fable-5"
-        | "auto" => 1_000_000,
+        | "claude-opus-4.8" | "claude-opus-5" | "claude-opus-5.5" | "claude-fable-5.1"
+        | "claude-fable-5.2" | "auto" => 1_000_000,
         "deepseek-3.2" => 164_000,
         "minimax-m2.5" | "minimax-m2.1" => 196_000,
         "qwen3-coder-next" => 256_000,
@@ -2181,16 +2210,40 @@ mod tests {
     }
 
     #[test]
-    fn test_map_model_fable_5() {
+    fn test_map_model_fable_5_falls_back_to_live_minor() {
+        // 上游已下线裸 claude-fable-5，统一回落到仍可用的 5.1
         assert_eq!(
             map_model("claude-fable-5"),
-            Some("claude-fable-5".to_string())
+            Some(FABLE_FALLBACK.to_string())
         );
         assert_eq!(
             map_model("claude-fable-5-thinking"),
-            Some("claude-fable-5".to_string())
+            Some(FABLE_FALLBACK.to_string())
         );
         assert_eq!(get_context_window_size("claude-fable-5"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_fable_5_1_and_5_2() {
+        for (minor, expected) in [("1", "claude-fable-5.1"), ("2", "claude-fable-5.2")] {
+            for input in [
+                format!("claude-fable-5.{minor}"),
+                format!("claude-fable-5.{minor}-thinking"),
+                format!("claude-fable-5-{minor}"),
+                format!("claude-fable-5-{minor}-thinking"),
+                format!("Claude-Fable-5.{minor}"),
+            ] {
+                assert_eq!(map_model(&input), Some(expected.to_string()), "{input}");
+            }
+            assert_eq!(get_context_window_size(expected), 1_000_000);
+            assert!(model_supports_xhigh_effort(expected));
+            assert!(model_supports_native_reasoning(expected));
+        }
+        // 带日期的 ID 不应被误判为小版本，而是回落到 FABLE_FALLBACK
+        assert_eq!(
+            map_model("claude-fable-5-20261015"),
+            Some(FABLE_FALLBACK.to_string())
+        );
     }
 
     #[test]
@@ -2275,21 +2328,22 @@ mod tests {
 
     #[test]
     fn test_map_model_fable_5_dated_and_xhigh() {
-        assert_eq!(
-            map_model("claude-fable-5"),
-            Some("claude-fable-5".to_string())
-        );
-        assert_eq!(
-            map_model("claude-fable-5-thinking"),
-            Some("claude-fable-5".to_string())
-        );
-        assert_eq!(
-            map_model("claude-fable-5-20260615"),
-            Some("claude-fable-5".to_string())
-        );
+        // 带日期的 ID 无法推断小版本，与裸 claude-fable-5 一样回落
+        for input in [
+            "claude-fable-5",
+            "claude-fable-5-thinking",
+            "claude-fable-5-20260615",
+        ] {
+            assert_eq!(
+                map_model(input),
+                Some(FABLE_FALLBACK.to_string()),
+                "{input}"
+            );
+        }
         assert_eq!(get_context_window_size("claude-fable-5"), 1_000_000);
-        // fable-5 支持 xhigh
+        // fable-5 系均支持 xhigh
         assert!(model_supports_xhigh_effort("claude-fable-5"));
+        assert!(model_supports_xhigh_effort(FABLE_FALLBACK));
     }
 
     #[test]

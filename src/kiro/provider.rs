@@ -117,7 +117,29 @@ struct ProxyAttemptResult {
     proxy: Option<ProxyConfig>,
 }
 
+/// 判断响应体是否为纯 JSON/文本错误体而非 AWS Event Stream 二进制帧。
+///
+/// 上游在 4xx/5xx 时直接返回 JSON（如
+/// `{"message":"Invalid model ID...","reason":"INVALID_MODEL_ID"}`），把它喂进
+/// [`EventStreamDecoder`] 会让 prelude 校验连续失败，打出
+/// 「Prelude 错误恢复: 跳过字节 0x7b」这类噪声告警。Event Stream 帧的首字节是
+/// 4 字节大端 total_length 的最高位，帧长上限 16MB，因此首字节恒为 0x00；
+/// 而 JSON / 纯文本错误体首字节是可见 ASCII。据此直接短路。
+fn is_plain_text_body(body: &[u8]) -> bool {
+    match body.first() {
+        None => true,
+        // 仅 0x00 开头才可能是合法 Event Stream 帧的 total_length 高位
+        Some(0) => false,
+        Some(&b) => b.is_ascii_graphic() || b.is_ascii_whitespace(),
+    }
+}
+
 fn readable_response_snippet_from_bytes(body: &[u8]) -> Option<String> {
+    // 纯 JSON/文本错误体不走事件流解码，避免无意义的 prelude 容错告警
+    if is_plain_text_body(body) {
+        return truncate_snippet(&String::from_utf8_lossy(body));
+    }
+
     let mut decoder = EventStreamDecoder::new();
     if decoder.feed(body).is_ok() {
         let mut text = String::new();
@@ -1903,6 +1925,27 @@ mod tests {
         assert_eq!(
             readable_response_snippet_from_bytes(b"{\"message\":\"bad request\"}").as_deref(),
             Some("{\"message\":\"bad request\"}")
+        );
+    }
+
+    #[test]
+    fn plain_json_error_body_skips_event_stream_decoding() {
+        // 上游 400 的 JSON 错误体必须被识别为纯文本，避免 prelude 容错逐字节跳过
+        let body = br#"{"message":"Invalid model ID.","reason":"INVALID_MODEL_ID"}"#;
+        assert!(is_plain_text_body(body));
+        assert_eq!(
+            readable_response_snippet_from_bytes(body).as_deref(),
+            Some(r#"{"message":"Invalid model ID.","reason":"INVALID_MODEL_ID"}"#)
+        );
+    }
+
+    #[test]
+    fn event_stream_body_is_not_treated_as_plain_text() {
+        let body = event_stream_frame("assistantResponseEvent", r#"{"content":"hi"}"#);
+        assert!(!is_plain_text_body(&body));
+        assert_eq!(
+            readable_response_snippet_from_bytes(&body).as_deref(),
+            Some("hi")
         );
     }
 }

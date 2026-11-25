@@ -319,6 +319,31 @@ mod tests {
     }
 
     #[test]
+    fn merge_keeps_fable_5_x_versions_distinct() {
+        // 上游 ListAvailableModels 当前仅暴露 5.1 / 5.2（裸 claude-fable-5 已下线）
+        let upstream = vec![up("claude-fable-5.1", None), up("claude-fable-5.2", None)];
+        let merged = merge_models(&upstream, super::super::handlers::available_models());
+        let ids = ids(&merged);
+
+        for (dashed, upstream_id, name) in [
+            ("claude-fable-5-1", "claude-fable-5.1", "Claude Fable 5.1"),
+            ("claude-fable-5-2", "claude-fable-5.2", "Claude Fable 5.2"),
+        ] {
+            assert!(ids.contains(&dashed), "missing {dashed}");
+            let thinking = format!("{dashed}-thinking");
+            assert!(ids.contains(&thinking.as_str()), "missing {thinking}");
+            assert_eq!(normalize_model_id(dashed), upstream_id);
+            assert_eq!(normalize_model_id(&thinking), upstream_id);
+            let m = merged.iter().find(|m| m.id == dashed).unwrap();
+            assert_eq!(m.display_name, name);
+        }
+
+        // 上游未返回的裸 claude-fable-5 不应出现在对外列表中
+        assert!(!ids.contains(&"claude-fable-5"));
+        assert!(!ids.contains(&"claude-fable-5-thinking"));
+    }
+
+    #[test]
     fn merge_has_no_duplicate_ids() {
         let upstream = vec![
             up("claude-opus-5.5", None),
