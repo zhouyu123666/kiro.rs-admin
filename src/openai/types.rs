@@ -183,6 +183,9 @@ pub fn openai_model_to_kiro_model(model: &str) -> String {
     }
 }
 
+/// 不带 metadata 的便捷封装，仅供单元测试使用；业务代码统一走
+/// [`chat_to_anthropic_with_metadata`]。
+#[cfg(test)]
 pub fn chat_to_anthropic(
     req: &ChatCompletionRequest,
 ) -> Result<ConvertedOpenAIRequest, OpenAIConversionError> {
@@ -1258,10 +1261,6 @@ pub fn assistant_message_for_history(parts: &AssistantParts) -> OpenAIMessage {
         tool_call_id: None,
         name: None,
     }
-}
-
-pub fn response_output_from_parts(parts: &AssistantParts) -> (Vec<Value>, String) {
-    response_output_from_parts_with_tools(parts, &ToolKindMap::new())
 }
 
 pub fn response_output_from_parts_with_tools(

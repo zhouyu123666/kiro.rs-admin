@@ -6,6 +6,7 @@
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
 use reqwest::{Client, header};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1007,6 +1008,10 @@ impl KiroProvider {
         // 故障转移到不同凭据时各记 1 次。
         let mut rpm_recorded: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
+        // 实际发送的请求体。仅在上游明确拒绝历史思考签名时被替换为剥离版本，
+        // 其余情况始终等于调用方传入的原始 body。
+        let mut effective_body: Cow<'_, str> = Cow::Borrowed(request_body);
+        let mut stripped_reasoning = false;
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
@@ -1087,7 +1092,7 @@ impl KiroProvider {
                     &ctx,
                     &machine_id,
                     config,
-                    request_body,
+                    &effective_body,
                 )
                 .await
             {
@@ -1203,6 +1208,35 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                // 唯一例外：可识别的历史签名失效，可通过移除 history reasoning 恢复。
+                // 客户端中途换模型或改 MCP 工具集时，旧回合的 signature 会校验失败。
+                // 这不是凭据问题，不惩罚账号；重试消耗既有预算，不额外加预算。
+                if !stripped_reasoning
+                    && attempt + 1 < max_retries
+                    && is_thinking_signature_invalid(&body)
+                    && let Some(stripped) = strip_history_reasoning_content(&effective_body)
+                {
+                    effective_body = Cow::Owned(stripped);
+                    stripped_reasoning = true;
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        Some(400),
+                        outcome::BAD_REQUEST,
+                        Some(&body),
+                        attempt_start,
+                    );
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    tracing::warn!("上游拒绝历史思考签名，移除 history reasoningContent 后重试一次");
+                    continue;
+                }
                 Self::emit_attempt(
                     sink,
                     attempt,
@@ -1350,7 +1384,7 @@ impl KiroProvider {
                             &ctx,
                             &machine_id,
                             config,
-                            request_body,
+                            &effective_body,
                             selected_proxy.clone(),
                         )
                         .await
@@ -1756,6 +1790,41 @@ impl KiroProvider {
     }
 }
 
+/// 只匹配明确的上游错误码，不匹配错误消息里的任意词。
+///
+/// 泛化的「签名无效」可能指认证问题，不能据此改写历史。
+fn is_thinking_signature_invalid(body: &str) -> bool {
+    const CODE: &str = "THINKING_SIGNATURE_INVALID";
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.trim() == CODE;
+    };
+    ["reason", "code", "__type"]
+        .iter()
+        .any(|key| value.get(key).and_then(|v| v.as_str()) == Some(CODE))
+}
+
+/// 只移除历史 **assistant** 消息的原生 reasoning。
+///
+/// 当前输入、effort、工具、路由字段与其它历史字段全部原样保留；
+/// `userInputMessage` 下的同名键不碰。无可移除内容时返回 `None`，避免无效重试。
+fn strip_history_reasoning_content(request_body: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(request_body).ok()?;
+    let history = value
+        .get_mut("conversationState")?
+        .get_mut("history")?
+        .as_array_mut()?;
+    let mut changed = false;
+    for message in history {
+        if let Some(assistant) = message
+            .get_mut("assistantResponseMessage")
+            .and_then(|v| v.as_object_mut())
+        {
+            changed |= assistant.remove("reasoningContent").is_some();
+        }
+    }
+    changed.then(|| serde_json::to_string(&value).ok()).flatten()
+}
+
 fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<UpstreamRateLimitError>().is_some()
 }
@@ -1946,6 +2015,104 @@ mod tests {
         assert_eq!(
             readable_response_snippet_from_bytes(&body).as_deref(),
             Some("hi")
+        );
+    }
+}
+
+#[cfg(test)]
+mod history_reasoning_strip_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn request_body() -> Value {
+        json!({
+            "conversationState": {
+                "conversationId": "test-reasoning-session",
+                "currentMessage": {
+                    "userInputMessage": {"content": "continue", "modelId": "claude-opus-5.5"}
+                },
+                "history": [
+                    {"userInputMessage": {"content": "hello", "reasoningContent": "untouched"}},
+                    {"assistantResponseMessage": {
+                        "content": "answer",
+                        "toolUses": [{"toolUseId": "tool-1"}],
+                        "reasoningContent": {"reasoningText": {"text": "private", "signature": "old"}}
+                    }},
+                    {"assistantResponseMessage": {
+                        "content": " ",
+                        "reasoningContent": {"redactedContent": "sealed"}
+                    }}
+                ]
+            },
+            "additionalModelRequestFields": {"output_config": {"effort": "high"}},
+            "profileArn": "original-profile"
+        })
+    }
+
+    #[test]
+    fn detection_requires_explicit_thinking_signature_code() {
+        for body in [
+            r#"{"reason":"THINKING_SIGNATURE_INVALID"}"#,
+            r#"{"code":"THINKING_SIGNATURE_INVALID"}"#,
+            r#"{"__type":"THINKING_SIGNATURE_INVALID"}"#,
+            "THINKING_SIGNATURE_INVALID",
+        ] {
+            assert!(is_thinking_signature_invalid(body), "{body}");
+        }
+        // 泛化的签名/认证错误不得触发历史改写
+        for body in [
+            r#"{"reason":"INVALID_SIGNATURE"}"#,
+            r#"{"message":"Invalid signature while thinking"}"#,
+            r#"{"reason":"NOT_THINKING_SIGNATURE_INVALID"}"#,
+            r#"{"reason":"CONTENT_LENGTH_EXCEEDS_THRESHOLD"}"#,
+            "malformed THINKING_SIGNATURE_INVALID body",
+            "{}",
+        ] {
+            assert!(!is_thinking_signature_invalid(body), "{body}");
+        }
+    }
+
+    #[test]
+    fn stripping_removes_only_assistant_history_reasoning() {
+        let original = request_body();
+        let stripped: Value =
+            serde_json::from_str(&strip_history_reasoning_content(&original.to_string()).unwrap())
+                .unwrap();
+
+        let history = stripped["conversationState"]["history"].as_array().unwrap();
+        // userInputMessage 下的同名键不碰
+        assert_eq!(history[0]["userInputMessage"]["reasoningContent"], "untouched");
+        // assistant 的 reasoningContent 被移除，正文与工具保留
+        assert!(history[1]["assistantResponseMessage"].get("reasoningContent").is_none());
+        assert_eq!(history[1]["assistantResponseMessage"]["content"], "answer");
+        assert_eq!(
+            history[1]["assistantResponseMessage"]["toolUses"][0]["toolUseId"],
+            "tool-1"
+        );
+        assert!(history[2]["assistantResponseMessage"].get("reasoningContent").is_none());
+        // 当前输入、effort、路由字段原样保留
+        assert_eq!(stripped["additionalModelRequestFields"], original["additionalModelRequestFields"]);
+        assert_eq!(stripped["profileArn"], "original-profile");
+        assert_eq!(
+            stripped["conversationState"]["currentMessage"],
+            original["conversationState"]["currentMessage"]
+        );
+    }
+
+    #[test]
+    fn stripping_is_idempotent_and_reports_no_change() {
+        let once = strip_history_reasoning_content(&request_body().to_string()).unwrap();
+        // 已无可移除内容时返回 None，避免触发无意义的重试
+        assert!(strip_history_reasoning_content(&once).is_none());
+    }
+
+    #[test]
+    fn stripping_rejects_malformed_or_unrelated_bodies() {
+        assert!(strip_history_reasoning_content("not json").is_none());
+        assert!(strip_history_reasoning_content("{}").is_none());
+        assert!(
+            strip_history_reasoning_content(&json!({"conversationState": {"history": []}}).to_string())
+                .is_none()
         );
     }
 }

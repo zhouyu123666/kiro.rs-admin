@@ -26,7 +26,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
+use super::converter::{ConversionError, convert_request_with_mode};
 use super::handlers::{UsageRecordHook, map_provider_error};
 use super::stream::{CompletedToolUse, SseEvent};
 use super::types::{ErrorResponse, Message, MessagesRequest};
@@ -567,7 +567,7 @@ pub(super) async fn run_web_search_loop(
         let round_public_input = token::finalize_public_input_tokens(
             round_estimated_input,
             round.context_usage_percentage,
-            get_context_window_size(&payload.model),
+            &payload.model,
             round_output,
         );
         total_public_input += round_public_input;

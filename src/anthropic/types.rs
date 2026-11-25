@@ -261,6 +261,12 @@ pub struct ContentBlock {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    /// thinking 块的上游签名（客户端回传历史时携带），回放时逐字节保留。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// redacted_thinking 块的 base64 不透明载荷。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

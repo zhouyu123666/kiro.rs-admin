@@ -125,6 +125,10 @@ fn infer_owner(model_id: &str) -> &'static str {
         "zhipu"
     } else if lower.starts_with("qwen") {
         "qwen"
+    } else if lower.starts_with("grok") {
+        "xai"
+    } else if lower.starts_with("kimi") {
+        "moonshot"
     } else {
         "kiro"
     }
@@ -341,6 +345,43 @@ mod tests {
         // 上游未返回的裸 claude-fable-5 不应出现在对外列表中
         assert!(!ids.contains(&"claude-fable-5"));
         assert!(!ids.contains(&"claude-fable-5-thinking"));
+    }
+
+    #[test]
+    fn merge_lists_grok_kimi_glm_from_upstream() {
+        let upstream = vec![
+            up("grok-4.7", Some("Grok 4.7")),
+            up("kimi-k3", Some("Kimi K3")),
+            up("glm-5", Some("GLM 5")),
+        ];
+        let merged = merge_models(&upstream, super::super::handlers::available_models());
+
+        for (id, name, owner) in [
+            ("grok-4.7", "Grok 4.7", "xai"),
+            ("kimi-k3", "Kimi K3", "moonshot"),
+            ("glm-5", "GLM 5", "zhipu"),
+        ] {
+            let m = merged
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("missing {id}"));
+            assert_eq!(m.display_name, name);
+            assert_eq!(m.owned_by, owner);
+            // 对外 ID 与上游 ID 一致，请求时原样透传
+            assert_eq!(normalize_model_id(id), id);
+        }
+        // 非 Claude 模型不生成 -thinking 变体
+        assert!(!merged.iter().any(|m| m.id == "grok-4.7-thinking"));
+        assert!(!merged.iter().any(|m| m.id == "kimi-k3-thinking"));
+    }
+
+    #[test]
+    fn infer_owner_covers_new_upstream_families() {
+        // 静态列表未收录的同族新版本，归属方由前缀推断
+        assert_eq!(infer_owner("grok-5"), "xai");
+        assert_eq!(infer_owner("kimi-k4"), "moonshot");
+        assert_eq!(infer_owner("glm-6"), "zhipu");
+        assert_eq!(infer_owner("some-new-model"), "kiro");
     }
 
     #[test]

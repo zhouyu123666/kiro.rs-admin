@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+    HistoryUserMessage, KiroImage, KiroReasoningContent, Message, UserInputMessage,
+    UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::kiro::{
     AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig,
@@ -260,11 +261,18 @@ fn is_native_kiro_model(model_lower: &str) -> bool {
         || model_lower.starts_with("minimax-")
         || model_lower.starts_with("glm-")
         || model_lower.starts_with("qwen")
+        || model_lower.starts_with("grok-")
+        || model_lower.starts_with("kimi-")
 }
 
+/// 把 `claude-{family}-{major}.{minor}` / `claude-{family}-{major}-{minor}` 规范化为
+/// Kiro 的点号 ID，版本号之后的日期等后缀丢弃。
+///
+/// 点号与短横线两种写法必须得到同一结果：上游模型 ID 本身是点号写法
+/// （`claude-haiku-5.5`），客户端按原样回传时不能落到下面按族名兜底的分支。
 fn normalize_claude_version_model(model_lower: &str) -> Option<String> {
     let parts: Vec<&str> = model_lower.split('-').collect();
-    if parts.len() < 4 || parts.first() != Some(&"claude") {
+    if parts.first() != Some(&"claude") {
         return None;
     }
 
@@ -273,13 +281,14 @@ fn normalize_claude_version_model(model_lower: &str) -> Option<String> {
         return None;
     }
 
-    let major = *parts.get(2)?;
-    let minor = *parts.get(3)?;
-    if (1..=2).contains(&major.len())
-        && (1..=2).contains(&minor.len())
-        && major.chars().all(|c| c.is_ascii_digit())
-        && minor.chars().all(|c| c.is_ascii_digit())
-    {
+    let is_version_part =
+        |s: &str| (1..=2).contains(&s.len()) && s.chars().all(|c| c.is_ascii_digit());
+    let version = *parts.get(2)?;
+    let (major, minor) = match version.split_once('.') {
+        Some(dotted) => dotted,
+        None => (version, *parts.get(3)?),
+    };
+    if is_version_part(major) && is_version_part(minor) {
         return Some(format!("claude-{family}-{major}.{minor}"));
     }
 
@@ -344,7 +353,7 @@ fn claude_context_window(model_lower: &str) -> Option<i32> {
 
 /// 模型映射：将常见 Anthropic/别名模型名映射到 Kiro 模型 ID。
 ///
-/// Kiro 原生模型族（auto/deepseek/minimax/glm/qwen）直接透传，后续同族新版本
+/// Kiro 原生模型族（auto/deepseek/minimax/glm/qwen/grok/kimi）直接透传，后续同族新版本
 /// 不需要每次改代码；完全未知的模型由 `normalize_model_id` 负责透传给上游。
 pub fn map_model(model: &str) -> Option<String> {
     let trimmed = model.trim();
@@ -424,21 +433,71 @@ pub fn get_context_window_size(model: &str) -> i32 {
     let mapped = normalize_model_id(model);
     let model_lower = mapped.to_ascii_lowercase();
     match mapped.as_str() {
-        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => 272_000,
+        // 上游 maxInputTokens = 986000，contextUsagePercentage 也以它为分母
+        // （按 986000 还原出的已占用 token 恰为整数，按 272000 则不是）。
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" => 986_000,
         "claude-sonnet-4.6" | "claude-sonnet-5" | "claude-opus-4.6" | "claude-opus-4.7"
         | "claude-opus-4.8" | "claude-opus-5" | "claude-opus-5.5" | "claude-fable-5.1"
         | "claude-fable-5.2" | "auto" => 1_000_000,
         "deepseek-3.2" => 164_000,
         "minimax-m2.5" | "minimax-m2.1" => 196_000,
         "qwen3-coder-next" => 256_000,
+        // 以下取自 Kiro ListAvailableModels 的 maxInputTokens（2026-11）
+        "grok-4.7" => 500_000,
+        "kimi-k3" => 1_000_000,
+        "glm-5" => 200_000,
         _ if model_lower.starts_with("deepseek-") => 164_000,
         _ if model_lower.starts_with("minimax-") => 196_000,
         _ if model_lower.starts_with("qwen") => 256_000,
+        _ if model_lower.starts_with("grok-") => 500_000,
+        _ if model_lower.starts_with("kimi-") => 1_000_000,
         _ if model_lower.starts_with("claude-") => {
             claude_context_window(&model_lower).unwrap_or(200_000)
         }
         _ => 200_000,
     }
+}
+
+/// Kiro 后端固定占用的上下文 token 数（按模型标定）。
+///
+/// `contextUsagePercentage` 换算出的已占用上下文里，有一段不属于客户端输入：
+/// Kiro 后端自带的 system prompt，加上本服务无条件注入的身份策略与确认语。
+/// 这段开销随模型不同（约 1.4k ~ 6.2k），上游也会调整，所以不能用一个常量。
+///
+/// 标定方法（2026-11-25，ide 端点）：发送约 14 token 的单条 user 消息、
+/// 无 system、无 tools、输出 1 token，取 `窗口 × 百分比 − 1 − 14`。
+/// 同一请求重复多次取最小值：gpt-5.6-terra、grok、kimi、minimax 以及
+/// fable-5.2 的小请求，上游占用量会在最小值之上浮动（kimi-k3 可达数百 token，
+/// 浮动部分按输出单价计费，推断是上游未下发的隐藏输出），这部分不属于固定开销。
+/// kimi-k3 的最小值随样本数增加还在下降（8 次 1511，12 次 1498），表值有约
+/// 15 token 的不确定度，远小于它单次请求的浮动。
+/// 再用 40 / 160 句的重复文本复核增量是否线性。
+///
+/// 未列出的模型返回 `None`，计量回退到请求内容计数。新增模型前先实测，
+/// 不要按同代模型推断（同为 1M 窗口的 Opus 4.7 与 Opus 4.8 相差 4k）。
+/// 复核脚本：`test/overhead_check/run.sh`（实测上游，全量约 5 credits）。
+pub fn get_context_overhead_tokens(model: &str) -> Option<i32> {
+    let mapped = normalize_model_id(model);
+    Some(match mapped.as_str() {
+        "claude-sonnet-4.5" | "claude-opus-4.5" | "claude-haiku-4.5" | "claude-sonnet-4.6" => {
+            4_300
+        }
+        "claude-opus-4.6" => 4_362,
+        "claude-opus-4.7" => 6_249,
+        "claude-opus-4.8" | "claude-opus-5" | "claude-opus-5.5" | "claude-sonnet-5"
+        | "claude-sonnet-5.5" | "claude-haiku-5.5" | "claude-fable-5.1" | "claude-fable-5.2"
+        | "auto" => 2_172,
+        "gpt-5.6-sol" | "gpt-5.6-luna" => 1_361,
+        "gpt-5.6-terra" => 1_380,
+        "grok-4.7" => 1_414,
+        "kimi-k3" => 1_498,
+        "glm-5" => 3_876,
+        "deepseek-3.2" => 3_928,
+        "minimax-m2.5" => 3_855,
+        "minimax-m2.1" => 3_856,
+        "qwen3-coder-next" => 3_893,
+        _ => return None,
+    })
 }
 
 /// 是否为已确认接受 `additionalModelRequestFields.output_config` 的模型。
@@ -1719,8 +1778,41 @@ fn convert_tools(
     Ok(out)
 }
 
+/// 不带 `<thinking_mode>` 前缀时，上游是否仍会通过 `reasoningContentEvent`
+/// 返回带签名的原生推理。
+///
+/// 这与 [`model_supports_native_reasoning`]（上游是否**接受** effort 字段）不是
+/// 同一件事：Sonnet 4.6 / Opus 4.6 接受 `output_config.effort`，但不下发原生
+/// 推理事件，它们的 thinking 完全由 prompt 前缀产生（带内 `<thinking>`，无签名）。
+/// 对这类模型去掉前缀，thinking 会整个消失。
+///
+/// 名单只收录用真实凭据实测过的模型（2026-11-25，`-thinking` 后缀路径，
+/// 不带前缀仍返回带签名 thinking）。未列入的模型保留前缀，行为与改动前一致；
+/// 新增模型前先实测，不要按「同代模型」推断。
+fn model_returns_native_reasoning(model_id: &str) -> bool {
+    let m = model_id.to_ascii_lowercase();
+    m.contains("opus-4.7")
+        || m.contains("opus-4.8")
+        || m.contains("opus-5")
+        || m.contains("fable-5")
+        || m.contains("sonnet-5.5")
+}
+
 /// 生成thinking标签前缀
+///
+/// 仅当本次请求确实下发了原生 effort，**且**该模型已确认会返回原生推理事件时
+/// 才跳过前缀。此时推理由 `reasoningContentEvent` 单独返回并带签名，再用
+/// `<thinking_mode>` 要求模型把推理写进正文属于重复控制，且带内推理没有签名，
+/// 下一轮无法通过 `reasoningContent` 回传。
+///
+/// 其余情况保留前缀，包括「接受 effort 字段但不返回原生推理」的模型
+/// （Sonnet 4.6 / Opus 4.6）：它们同时带前缀和 wire 字段，与改动前一致。
 fn generate_thinking_prefix(req: &MessagesRequest, model_id: &str) -> Option<String> {
+    if model_returns_native_reasoning(model_id)
+        && build_additional_model_request_fields(req, model_id).is_some()
+    {
+        return None;
+    }
     if let Some(t) = &req.thinking {
         if t.thinking_type == "enabled" {
             return Some(format!(
@@ -1975,12 +2067,68 @@ fn unescape_inband_thinking_content(content: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// 为单值 wire 字段 `reasoningContent` 挑选至多一个完整的 reasoning 块。
+///
+/// 策略刻意保守：
+/// 1. 跨连续 assistant 消息统计**所有** reasoning 块，多于一个就整体省略
+///    —— 避免无签名块被后面的有签名块「遮掩」，也避免只回传交错推理轮次的
+///    一个子集。
+/// 2. 无签名或空签名的 thinking 无法被上游认证，省略。
+/// 3. redacted 块必须是有效 base64 且解码后非空。
+///
+/// 这些内容**不会**进入 assistant 正文：正文里出现模型推理原文会被上游分类器
+/// 判为 `REASONING_EXTRACTION` 并整轮拒答。
+fn history_reasoning_content(
+    messages: &[&super::types::Message],
+) -> Option<KiroReasoningContent> {
+    let mut blocks = messages
+        .iter()
+        .filter_map(|m| m.content.as_array())
+        .flatten()
+        .filter(|b| {
+            matches!(
+                b.get("type").and_then(|v| v.as_str()),
+                Some("thinking" | "redacted_thinking")
+            )
+        });
+    let block = blocks.next()?;
+    if blocks.next().is_some() {
+        // 多个推理块：保守省略，不做选择性拼接
+        return None;
+    }
+    match block.get("type")?.as_str()? {
+        "thinking" => {
+            let text = block.get("thinking")?.as_str()?;
+            let signature = block.get("signature")?.as_str()?;
+            if text.is_empty() || signature.trim().is_empty() {
+                return None;
+            }
+            Some(KiroReasoningContent::ReasoningText {
+                text: text.to_owned(),
+                signature: Some(signature.to_owned()),
+            })
+        }
+        "redacted_thinking" => {
+            use base64::Engine;
+            let data = block.get("data")?.as_str()?;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .ok()?;
+            if decoded.is_empty() {
+                return None;
+            }
+            Some(KiroReasoningContent::RedactedContent(data.to_owned()))
+        }
+        _ => None,
+    }
+}
+
 fn convert_assistant_message(
     msg: &super::types::Message,
     tool_name_map: &mut HashMap<String, String>,
     mode: ToolCompatibilityMode,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
-    let mut thinking_content = String::new();
+    let mut dropped_thinking = 0usize;
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
 
@@ -1992,10 +2140,10 @@ fn convert_assistant_message(
             for item in arr {
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
-                        "thinking" => {
-                            if let Some(thinking) = block.thinking {
-                                thinking_content.push_str(&thinking);
-                            }
+                        // 推理内容由 `reasoningContent` 协议字段单独携带，
+                        // 这里只计数以决定是否需要正文占位符。
+                        "thinking" | "redacted_thinking" => {
+                            dropped_thinking += 1;
                         }
                         "text" => {
                             if let Some(text) = block.text {
@@ -2020,31 +2168,24 @@ fn convert_assistant_message(
         _ => {}
     }
 
-    // 组合 thinking 和 text 内容
-    // 格式: <thinking>思考内容</thinking>\n\ntext内容
-    // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
-    // 编码无条件应用于所有载荷，与是否存在 thinking block 无关。若只在有 thinking
-    // 时编码，解码约定就会依赖消息形状：纯文本消息里的字面 `<thinking>` 未编码，
-    // 统一按约定解码的下游会误还原 `&amp;`，或把这段文本当成真实边界。
-    let thinking_content = escape_inband_thinking_content(&thinking_content);
+    // 推理内容不再拼进正文（见 `history_reasoning_content`）。
+    //
+    // 编码仍无条件应用于正文：解码约定（`unescape_inband_thinking_content`）是
+    // 跨轮次的，单侧停用会导致已编码的旧历史无法还原。对 thinking 边界而言该
+    // 编码已无意义，保留仅为向后兼容。
     let text_content = escape_inband_thinking_content(&text_content);
 
-    let final_content = if !thinking_content.is_empty() {
-        if !text_content.is_empty() {
-            format!(
-                "<thinking>{}</thinking>\n\n{}",
-                thinking_content, text_content
-            )
-        } else {
-            format!("<thinking>{}</thinking>", thinking_content)
-        }
-    } else if text_content.is_empty() && !tool_uses.is_empty() {
+    // Kiro API 要求 content 字段不能为空：只有 tool_use，或推理被移到
+    // `reasoningContent` 之后正文为空时，需要占位符。
+    let final_content = if text_content.is_empty() && (!tool_uses.is_empty() || dropped_thinking > 0)
+    {
         " ".to_string()
     } else {
         text_content
     };
 
     let mut assistant = AssistantMessage::new(final_content);
+    assistant.reasoning_content = history_reasoning_content(&[msg]);
     if !tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(tool_uses);
     }
@@ -2080,13 +2221,16 @@ fn merge_assistant_messages(
         }
     }
 
-    let content = if content_parts.is_empty() && !all_tool_uses.is_empty() {
+    // 推理移到 `reasoningContent` 后，正文与工具可能同时为空，此时仍需占位符。
+    let content = if content_parts.is_empty() {
         " ".to_string()
     } else {
         content_parts.join("\n\n")
     };
 
     let mut assistant = AssistantMessage::new(content);
+    // 跨全部待合并消息统一挑选，保证「多块则省略」的语义不被逐条合并绕过。
+    assistant.reasoning_content = history_reasoning_content(messages);
     if !all_tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(all_tool_uses);
     }
@@ -2209,6 +2353,48 @@ mod tests {
         assert_eq!(get_context_window_size("claude-opus-5.5"), 1_000_000);
     }
 
+    /// 回归：点号写法曾落到按族名兜底的分支，`claude-haiku-5.5` 被发成
+    /// `claude-haiku-4.5`，`claude-sonnet-5.5` 被发成 `claude-sonnet-5`。
+    #[test]
+    fn test_map_model_dotted_and_dashed_versions_agree() {
+        for (family, version) in [
+            ("haiku", "5.5"),
+            ("sonnet", "5.5"),
+            ("opus", "5.5"),
+            ("haiku", "4.5"),
+            ("sonnet", "4.6"),
+            ("opus", "4.8"),
+            ("fable", "5.2"),
+        ] {
+            let expected = format!("claude-{family}-{version}");
+            let dashed = expected.replace('.', "-");
+            for base in [expected.as_str(), dashed.as_str()] {
+                for suffix in ["", "-thinking", "-20270101", "-20270101-thinking"] {
+                    let model = format!("{base}{suffix}");
+                    assert_eq!(map_model(&model), Some(expected.clone()), "model={model}");
+                }
+            }
+            assert_eq!(
+                map_model(&expected.to_uppercase()),
+                Some(expected.clone()),
+                "uppercase {expected}"
+            );
+        }
+
+        assert_eq!(get_context_window_size("claude-haiku-5.5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-5.5"), 1_000_000);
+        assert_eq!(get_context_overhead_tokens("claude-haiku-5.5"), Some(2_172));
+        assert_eq!(
+            get_context_overhead_tokens("claude-haiku-5.5"),
+            get_context_overhead_tokens("claude-haiku-5-5")
+        );
+        // 不带小版本的写法不受影响
+        assert_eq!(map_model("claude-sonnet-5"), Some("claude-sonnet-5".to_string()));
+        assert_eq!(map_model("claude-opus-5"), Some("claude-opus-5".to_string()));
+        assert_eq!(map_model("claude-3-5-sonnet-20241022"), None);
+        assert_eq!(map_model("claude-3.5-haiku"), Some("claude-haiku-4.5".to_string()));
+    }
+
     #[test]
     fn test_map_model_fable_5_falls_back_to_live_minor() {
         // 上游已下线裸 claude-fable-5，统一回落到仍可用的 5.1
@@ -2275,10 +2461,27 @@ mod tests {
     }
 
     #[test]
+    fn test_grok_kimi_glm_passthrough_and_context_window() {
+        assert_eq!(map_model("grok-4.7"), Some("grok-4.7".to_string()));
+        assert_eq!(map_model("kimi-k3"), Some("kimi-k3".to_string()));
+        assert_eq!(map_model("glm-5"), Some("glm-5".to_string()));
+        // -thinking 后缀去掉后透传
+        assert_eq!(map_model("grok-4.7-thinking"), Some("grok-4.7".to_string()));
+        assert_eq!(map_model("kimi-k3-thinking"), Some("kimi-k3".to_string()));
+
+        assert_eq!(get_context_window_size("grok-4.7"), 500_000);
+        assert_eq!(get_context_window_size("kimi-k3"), 1_000_000);
+        assert_eq!(get_context_window_size("glm-5"), 200_000);
+        // 同族新版本沿用族默认窗口
+        assert_eq!(get_context_window_size("grok-5"), 500_000);
+        assert_eq!(get_context_window_size("kimi-k4"), 1_000_000);
+    }
+
+    #[test]
     fn test_gpt_5_6_passthrough_context_and_effort_wire() {
         for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             assert_eq!(map_model(model).as_deref(), Some(model));
-            assert_eq!(get_context_window_size(model), 272_000);
+            assert_eq!(get_context_window_size(model), 986_000);
 
             let request = minimal_request_with_effort(model, "xhigh");
             let fields = build_additional_model_request_fields(&request, model).unwrap();
@@ -3785,25 +3988,36 @@ mod tests {
         let result =
             convert_assistant_message(&msg, &mut HashMap::new(), ToolCompatibilityMode::Raw)
                 .expect("应该成功转换");
-        let wire = result.assistant_response_message.content;
+        let am = result.assistant_response_message;
+        let wire = am.content;
 
-        // 载荷内所有同名标签都已编码，只剩 kiro.rs 添加的一对真实边界。
-        assert_eq!(wire.matches("<thinking>").count(), 1);
-        assert_eq!(wire.matches("</thinking>").count(), 1);
-
-        let encoded = wire
-            .strip_prefix("<thinking>")
-            .expect("应有 thinking 起始边界");
-        let (encoded_thinking, encoded_text) = encoded
-            .split_once("</thinking>\n\n")
-            .expect("应有唯一 thinking 结束边界");
+        // 新契约：推理走 `reasoningContent`，正文里不再有 kiro.rs 添加的真实边界。
+        // 正文中客户端自带的字面标签必须仍被编码，使下游不会把它误当成边界。
         assert_eq!(
-            unescape_inband_thinking_content(encoded_thinking),
-            original_thinking
+            wire.matches("<thinking>").count(),
+            0,
+            "正文不应再有 thinking 边界: {wire:?}"
         );
         assert_eq!(
-            unescape_inband_thinking_content(encoded_text),
-            original_text
+            wire.matches("</thinking>").count(),
+            0,
+            "正文不应再有 thinking 边界: {wire:?}"
+        );
+
+        // 正文编码仍可逆，保证跨轮次解码约定不被破坏。
+        assert_eq!(unescape_inband_thinking_content(&wire), original_text);
+
+        // 推理原文及签名逐字节保留在协议字段里，且不出现在正文中。
+        assert_eq!(
+            am.reasoning_content,
+            Some(KiroReasoningContent::ReasoningText {
+                text: original_thinking.to_string(),
+                signature: Some("upstream-signature".to_string()),
+            })
+        );
+        assert!(
+            !wire.contains("plus"),
+            "推理原文不得出现在正文: {wire:?}"
         );
     }
 
@@ -3908,10 +4122,24 @@ mod tests {
                 .expect("合并应成功");
 
         let content = &result.assistant_response_message.content;
-        assert!(content.contains("<thinking>"), "应包含 thinking 标签");
+        // 推理不再进正文：正文只保留可见文本。
+        assert!(
+            !content.contains("<thinking>"),
+            "正文不应再有 thinking 标签: {content:?}"
+        );
+        assert!(
+            !content.contains("Let me think about this"),
+            "推理原文不得出现在正文: {content:?}"
+        );
         assert!(
             content.contains("Let me read that file"),
             "应包含第二条消息的 text 内容"
+        );
+
+        // 两条消息各有一个 thinking 块（且都无签名）：多块 + 无签名，保守省略。
+        assert_eq!(
+            result.assistant_response_message.reasoning_content, None,
+            "多个推理块应整体省略"
         );
 
         let tool_uses = result
@@ -4103,5 +4331,471 @@ mod tests {
             Some("file content"),
             "text-only tool_result content should be preserved as-is"
         );
+    }
+}
+
+#[cfg(test)]
+mod native_history_reasoning_tests {
+    use super::*;
+    use super::super::types::Message as AnthropicMessage;
+
+    fn assistant(content: serde_json::Value) -> AnthropicMessage {
+        AnthropicMessage {
+            role: "assistant".to_string(),
+            content,
+        }
+    }
+
+    fn convert(msg: &AnthropicMessage) -> AssistantMessage {
+        convert_assistant_message(msg, &mut HashMap::new(), ToolCompatibilityMode::Raw)
+            .expect("应该成功转换")
+            .assistant_response_message
+    }
+
+    /// 有签名的单个 thinking 块：原文与签名逐字节保留，正文不含推理。
+    #[test]
+    fn signed_thinking_goes_to_reasoning_content_not_body() {
+        let am = convert(&assistant(serde_json::json!([
+            {"type": "thinking", "thinking": "LOOP_PLAN step 1", "signature": "sig-abc"},
+            {"type": "text", "text": "visible answer"}
+        ])));
+
+        assert_eq!(am.content, "visible answer");
+        assert!(!am.content.contains("<thinking>"));
+        assert!(!am.content.contains("LOOP_PLAN"));
+        assert_eq!(
+            am.reasoning_content,
+            Some(KiroReasoningContent::ReasoningText {
+                text: "LOOP_PLAN step 1".to_string(),
+                signature: Some("sig-abc".to_string()),
+            })
+        );
+    }
+
+    /// 无签名：无法被上游认证，省略。
+    #[test]
+    fn unsigned_thinking_is_omitted() {
+        let am = convert(&assistant(serde_json::json!([
+            {"type": "thinking", "thinking": "no signature here"},
+            {"type": "text", "text": "answer"}
+        ])));
+
+        assert_eq!(am.reasoning_content, None);
+        assert!(!am.content.contains("no signature here"));
+    }
+
+    /// 空白签名等同无签名。
+    #[test]
+    fn blank_signature_is_omitted() {
+        let am = convert(&assistant(serde_json::json!([
+            {"type": "thinking", "thinking": "text", "signature": "   "}
+        ])));
+        assert_eq!(am.reasoning_content, None);
+    }
+
+    /// 空推理文本即便带签名也省略。
+    #[test]
+    fn empty_thinking_text_is_omitted() {
+        let am = convert(&assistant(serde_json::json!([
+            {"type": "thinking", "thinking": "", "signature": "sig"}
+        ])));
+        assert_eq!(am.reasoning_content, None);
+    }
+
+    /// 多块时整体省略：无签名块不能被后面的有签名块「遮掩」。
+    #[test]
+    fn multiple_blocks_are_omitted_even_if_one_is_signed() {
+        let am = convert(&assistant(serde_json::json!([
+            {"type": "thinking", "thinking": "unsigned draft"},
+            {"type": "thinking", "thinking": "signed final", "signature": "sig"},
+            {"type": "text", "text": "answer"}
+        ])));
+
+        assert_eq!(am.reasoning_content, None);
+        assert!(!am.content.contains("unsigned draft"));
+        assert!(!am.content.contains("signed final"));
+    }
+
+    /// 有效 base64 的 redacted 块原样回传。
+    #[test]
+    fn valid_redacted_block_is_preserved() {
+        // "secret" 的 base64
+        let am = convert(&assistant(serde_json::json!([
+            {"type": "redacted_thinking", "data": "c2VjcmV0"}
+        ])));
+        assert_eq!(
+            am.reasoning_content,
+            Some(KiroReasoningContent::RedactedContent("c2VjcmV0".to_string()))
+        );
+    }
+
+    /// 非法 base64 / 解码后为空：省略。
+    #[test]
+    fn invalid_or_empty_redacted_block_is_omitted() {
+        for data in ["!!!not-base64!!!", ""] {
+            let am = convert(&assistant(serde_json::json!([
+                {"type": "redacted_thinking", "data": data}
+            ])));
+            assert_eq!(am.reasoning_content, None, "data={data:?}");
+        }
+    }
+
+    /// 只有推理、无正文无工具：content 必须是占位符而非空串（Kiro 要求非空）。
+    #[test]
+    fn thinking_only_history_gets_placeholder_content() {
+        let am = convert(&assistant(serde_json::json!([
+            {"type": "thinking", "thinking": "only reasoning", "signature": "sig"}
+        ])));
+
+        assert_eq!(am.content, " ");
+        assert!(am.reasoning_content.is_some());
+    }
+
+    /// 纯文本消息（content 为 string）不受影响。
+    #[test]
+    fn plain_string_content_has_no_reasoning() {
+        let am = convert(&assistant(serde_json::json!("just text")));
+        assert_eq!(am.content, "just text");
+        assert_eq!(am.reasoning_content, None);
+    }
+
+    /// 序列化键名对齐 Kiro/Q 协议。
+    #[test]
+    fn wire_format_uses_expected_camel_case_keys() {
+        let am = convert(&assistant(serde_json::json!([
+            {"type": "thinking", "thinking": "t", "signature": "s"}
+        ])));
+        let wire = serde_json::to_value(&am).unwrap();
+        assert_eq!(wire["reasoningContent"]["reasoningText"]["text"], "t");
+        assert_eq!(wire["reasoningContent"]["reasoningText"]["signature"], "s");
+
+        let redacted = convert(&assistant(serde_json::json!([
+            {"type": "redacted_thinking", "data": "c2VjcmV0"}
+        ])));
+        let wire = serde_json::to_value(&redacted).unwrap();
+        assert_eq!(wire["reasoningContent"]["redactedContent"], "c2VjcmV0");
+    }
+
+    /// 往返：序列化后可反序列化回同一个值。
+    #[test]
+    fn reasoning_content_roundtrips() {
+        let am = convert(&assistant(serde_json::json!([
+            {"type": "redacted_thinking", "data": "c2VjcmV0"}
+        ])));
+        let json = serde_json::to_string(&am).unwrap();
+        let back: AssistantMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.reasoning_content,
+            Some(KiroReasoningContent::RedactedContent("c2VjcmV0".to_string()))
+        );
+    }
+
+    /// 合并路径：跨消息统计，单个有签名块仍可回传。
+    #[test]
+    fn merge_keeps_single_signed_block_across_messages() {
+        let m1 = assistant(serde_json::json!([
+            {"type": "thinking", "thinking": "the only reasoning", "signature": "sig"},
+            {"type": "text", "text": "first"}
+        ]));
+        let m2 = assistant(serde_json::json!([{"type": "text", "text": "second"}]));
+        let messages: Vec<&AnthropicMessage> = vec![&m1, &m2];
+
+        let am = merge_assistant_messages(&messages, &mut HashMap::new(), ToolCompatibilityMode::Raw)
+            .expect("合并应成功")
+            .assistant_response_message;
+
+        assert!(!am.content.contains("the only reasoning"));
+        assert!(am.content.contains("first") && am.content.contains("second"));
+        assert_eq!(
+            am.reasoning_content,
+            Some(KiroReasoningContent::ReasoningText {
+                text: "the only reasoning".to_string(),
+                signature: Some("sig".to_string()),
+            })
+        );
+    }
+
+    /// 合并路径：正文与工具同时为空时仍补占位符。
+    #[test]
+    fn merge_thinking_only_messages_get_placeholder() {
+        let m1 = assistant(serde_json::json!([
+            {"type": "thinking", "thinking": "a", "signature": "s1"}
+        ]));
+        let m2 = assistant(serde_json::json!([
+            {"type": "thinking", "thinking": "b", "signature": "s2"}
+        ]));
+        let messages: Vec<&AnthropicMessage> = vec![&m1, &m2];
+
+        let am = merge_assistant_messages(&messages, &mut HashMap::new(), ToolCompatibilityMode::Raw)
+            .expect("合并应成功")
+            .assistant_response_message;
+
+        assert_eq!(am.content, " ", "空正文必须补占位符");
+        assert_eq!(am.reasoning_content, None, "多块应省略");
+    }
+}
+
+#[cfg(test)]
+mod reasoning_extraction_regression_tests {
+    use super::*;
+    use super::super::types::{Message as AnthropicMessage, OutputConfig, Thinking};
+
+    /// 复现 issue #158 的触发形态：Opus 5.5 + adaptive thinking + 多轮 tool_use，
+    /// 历史里带 thinking。修复前转换结果的 history 正文会出现明文
+    /// `<thinking>LOOP_PLAN…</thinking>`，被上游判为 REASONING_EXTRACTION 整轮拒答。
+    ///
+    /// 契约：整个请求体的 history 中不得出现 thinking 边界或推理原文。
+    #[test]
+    fn opus_55_multi_turn_tool_use_history_has_no_inband_thinking() {
+        let req = MessagesRequest {
+            force_web_search_loop: false,
+            model: "claude-opus-5.5".to_string(),
+            max_tokens: 4096,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("读一下这个文件"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "thinking", "thinking": "LOOP_PLAN: 先读文件再回答", "signature": "sig-1"},
+                        {"type": "text", "text": "好的"},
+                        {"type": "tool_use", "id": "toolu_01", "name": "read_file", "input": {"path": "/a.txt"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_01", "content": "file body"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "thinking", "thinking": "SECOND_TURN_REASONING: 内容已读到", "signature": "sig-2"},
+                        {"type": "text", "text": "文件内容是 file body"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("继续"),
+                },
+            ],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 20000,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "high".to_string(),
+            }),
+            metadata: None,
+        };
+
+        let result = convert_request(&req).expect("转换应成功");
+        let wire = serde_json::to_string(&result.conversation_state).expect("序列化应成功");
+
+        // 核心断言：请求体任何位置都不再有带内 thinking 边界。
+        // 修复前这里会出现 `"content":"<thinking>LOOP_PLAN…</thinking>\n\n好的"`。
+        assert!(
+            !wire.contains("<thinking>") && !wire.contains("</thinking>"),
+            "请求体仍含 thinking 边界，会触发 REASONING_EXTRACTION: {wire}"
+        );
+        // 已下发原生 effort 时，不得再用 prompt 标签要求模型把推理写进正文。
+        assert!(
+            !wire.contains("<thinking_mode>") && !wire.contains("<thinking_effort>"),
+            "原生 effort 已下发，请求体不应再含 thinking 控制标签: {wire}"
+        );
+        assert_eq!(
+            result
+                .additional_model_request_fields
+                .as_ref()
+                .and_then(|f| f.output_config.as_ref())
+                .map(|c| c.effort.as_str()),
+            Some("high"),
+            "当前轮的原生 effort 必须保留"
+        );
+
+        let history = &result.conversation_state.history;
+        let assistants: Vec<_> = history
+            .iter()
+            .filter_map(|m| match m {
+                crate::kiro::model::requests::conversation::Message::Assistant(a) => {
+                    Some(&a.assistant_response_message)
+                }
+                _ => None,
+            })
+            .collect();
+
+        // 推理原文只允许出现在 reasoningContent 协议字段，绝不进 content 正文。
+        for a in &assistants {
+            assert!(
+                !a.content.contains("LOOP_PLAN") && !a.content.contains("SECOND_TURN_REASONING"),
+                "推理原文泄漏进 assistant 正文: {:?}",
+                a.content
+            );
+        }
+        // 历史里每条 assistant 都应保留正文与工具配对
+        assert!(
+            assistants.iter().all(|a| !a.content.is_empty()),
+            "Kiro 要求 content 非空"
+        );
+        // 两轮各自带一个有签名的推理块，应各自回传到协议字段
+        for sig in ["sig-1", "sig-2"] {
+            assert!(
+                assistants.iter().any(|a| matches!(
+                    &a.reasoning_content,
+                    Some(KiroReasoningContent::ReasoningText { signature: Some(s), .. }) if s == sig
+                )),
+                "签名 {sig} 对应的推理应走 reasoningContent"
+            );
+        }
+        // 工具配对保留
+        assert!(
+            assistants
+                .iter()
+                .any(|a| a.tool_uses.as_ref().is_some_and(|t| {
+                    t.iter().any(|u| u.tool_use_id == "toolu_01")
+                })),
+            "历史工具调用应保留"
+        );
+    }
+
+    fn thinking_request(model: &str, thinking_type: &str, effort: Option<&str>) -> MessagesRequest {
+        MessagesRequest {
+            force_web_search_loop: false,
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hello"),
+            }],
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: thinking_type.to_string(),
+                budget_tokens: 2048,
+            }),
+            output_config: effort.map(|e| OutputConfig {
+                effort: e.to_string(),
+            }),
+            metadata: None,
+        }
+    }
+
+    /// thinking 控制路径按模型分三类，任何启用 thinking 的请求至少保留一条：
+    /// - 返回原生推理的模型：只走 wire 字段，不注入前缀
+    /// - 接受 effort 但不返回原生推理的模型（Sonnet 4.6 / Opus 4.6）：两条都保留，
+    ///   去掉前缀会让 thinking 整个消失（2026-11-25 实测回归）
+    /// - 不接受 effort 的模型：只走前缀
+    #[test]
+    fn thinking_control_paths_by_model_class() {
+        // (model, thinking_type, effort, 期望 native, 期望 prefix)
+        let cases = [
+            ("claude-opus-5.5", "adaptive", Some("high"), true, false),
+            ("claude-opus-5.5", "enabled", None, true, false),
+            ("claude-opus-5", "enabled", None, true, false),
+            ("claude-fable-5.1", "enabled", None, true, false),
+            ("claude-fable-5.2", "enabled", None, true, false),
+            ("claude-sonnet-5.5", "enabled", None, true, false),
+            ("claude-opus-4.8", "adaptive", Some("xhigh"), true, false),
+            ("claude-opus-4.7", "enabled", None, true, false),
+            ("claude-sonnet-4.6", "enabled", None, true, true),
+            ("claude-sonnet-4.6", "adaptive", Some("high"), true, true),
+            ("claude-opus-4.6", "adaptive", Some("high"), true, true),
+            ("claude-opus-4.6", "enabled", None, false, true),
+            ("claude-sonnet-5", "enabled", None, true, true),
+            ("claude-sonnet-4.5", "enabled", None, false, true),
+            ("claude-opus-4.5", "enabled", None, false, true),
+            ("claude-haiku-4.5", "adaptive", Some("low"), false, true),
+        ];
+        for (model, thinking_type, effort, want_native, want_prefix) in cases {
+            let req = thinking_request(model, thinking_type, effort);
+            let native = build_additional_model_request_fields(&req, model).is_some();
+            let prefix = generate_thinking_prefix(&req, model).is_some();
+            assert_eq!(
+                (native, prefix),
+                (want_native, want_prefix),
+                "{model}/{thinking_type}: (native, prefix) 与预期不符"
+            );
+            assert!(
+                native || prefix,
+                "{model}/{thinking_type}: 启用 thinking 的请求至少要有一条控制路径"
+            );
+        }
+    }
+
+    /// 回归保护：Sonnet 4.6 / Opus 4.6 的请求体必须仍带 `<thinking_mode>` 前缀。
+    /// 这两个模型不返回原生推理事件，前缀是它们唯一的 thinking 来源。
+    #[test]
+    fn models_without_native_reasoning_events_keep_prefix_on_the_wire() {
+        for model in ["claude-sonnet-4.6", "claude-opus-4.6"] {
+            let req = thinking_request(model, "adaptive", Some("high"));
+            let result = convert_request(&req).expect("转换应成功");
+            let wire = serde_json::to_string(&result.conversation_state).expect("序列化应成功");
+            assert!(
+                wire.contains("<thinking_mode>adaptive</thinking_mode>"),
+                "{model}: 请求体缺少 thinking 前缀，thinking 会消失: {wire}"
+            );
+            assert!(
+                result.additional_model_request_fields.is_some(),
+                "{model}: 原生 effort 字段应照常下发"
+            );
+        }
+    }
+
+    /// Opus 5.5 走原生路径：请求体无 prompt 控制标签，effort 走 wire 字段。
+    #[test]
+    fn opus_55_native_effort_request_has_no_thinking_prefix() {
+        for thinking_type in ["adaptive", "enabled"] {
+            let req = thinking_request("claude-opus-5.5", thinking_type, None);
+            let result = convert_request(&req).expect("转换应成功");
+            let wire = serde_json::to_string(&result.conversation_state).expect("序列化应成功");
+            assert!(
+                !wire.contains("<thinking_mode>") && !wire.contains("<max_thinking_length>"),
+                "{thinking_type}: 请求体不应含 thinking 控制标签: {wire}"
+            );
+            assert!(
+                result
+                    .additional_model_request_fields
+                    .is_some_and(|f| f.output_config.is_some()),
+                "{thinking_type}: 应下发原生 output_config.effort"
+            );
+        }
+    }
+
+    /// 不接受原生 effort 的模型保持原有 prompt 前缀，行为不变。
+    #[test]
+    fn legacy_models_keep_thinking_prefix() {
+        let req = thinking_request("claude-sonnet-4.5", "enabled", None);
+        assert_eq!(
+            generate_thinking_prefix(&req, "claude-sonnet-4.5").as_deref(),
+            Some(
+                "<thinking_mode>enabled</thinking_mode><max_thinking_length>2048</max_thinking_length>"
+            )
+        );
+        let result = convert_request(&req).expect("转换应成功");
+        assert!(result.additional_model_request_fields.is_none());
+        let wire = serde_json::to_string(&result.conversation_state).expect("序列化应成功");
+        assert!(wire.contains("<thinking_mode>enabled</thinking_mode>"));
+
+        // Opus 4.6 的 enabled 模式上游不接受 output_config，仍需 prompt 前缀。
+        let req = thinking_request("claude-opus-4.6", "enabled", None);
+        assert!(build_additional_model_request_fields(&req, "claude-opus-4.6").is_none());
+        assert!(generate_thinking_prefix(&req, "claude-opus-4.6").is_some());
+    }
+
+    /// thinking 显式关闭时两条路径都不应出现。
+    #[test]
+    fn disabled_thinking_sends_neither_prefix_nor_native_effort() {
+        let req = thinking_request("claude-opus-5.5", "disabled", Some("high"));
+        assert!(build_additional_model_request_fields(&req, "claude-opus-5.5").is_none());
+        assert!(generate_thinking_prefix(&req, "claude-opus-5.5").is_none());
     }
 }

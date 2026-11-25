@@ -1404,7 +1404,6 @@ impl SseStateManager {
     }
 }
 
-use super::converter::get_context_window_size;
 
 /// 上游成功结束却没有返回任何 assistant 内容时给客户端的稳定错误信息。
 ///
@@ -1509,7 +1508,7 @@ impl StreamContext {
         let total_real = crate::token::finalize_public_input_tokens(
             self.input_tokens,
             self.context_usage_percentage,
-            get_context_window_size(&self.model),
+            &self.model,
             self.output_tokens,
         );
         self.cache_usage.resolve_against_total(total_real)
@@ -2265,14 +2264,13 @@ impl StreamContext {
     ) -> Vec<SseEvent> {
         // 原生 reasoningContentEvent 不会经过 process_assistant_response，必须在这里做同一
         // 次熔断；这正是 `33` 洪水绕过旧保护的路径。
+        //
+        // thinking 未启用时直接丢弃，**不得降级为普通 text**：上游即使在未收到
+        // effort 的情况下也可能自行开启 reasoning，若把推理原文包装成
+        // `{"type":"text"}` 返回，客户端下一轮回传时其类型已是 text，任何
+        // thinking 过滤都拦不住，会原样进入 assistantResponseMessage.content
+        // 并再次触发上游 REASONING_EXTRACTION 拒答。
         if !self.thinking_enabled {
-            if let Some(text) = reasoning.text.as_deref()
-                && !text.is_empty()
-            {
-                self.output_text.push_str(text);
-                self.refresh_output_tokens();
-                return self.create_text_delta_events(text);
-            }
             return Vec::new();
         }
 
@@ -5587,7 +5585,7 @@ mod tests {
     }
 
     #[test]
-    fn test_native_reasoning_text_downgrades_to_text_when_thinking_disabled() {
+    fn test_native_reasoning_is_not_text_when_thinking_disabled() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -5606,11 +5604,18 @@ mod tests {
         )));
         all_events.extend(ctx.generate_final_events());
 
-        assert_eq!(
-            collect_text_content(&all_events),
-            "visible reasoning fallback"
-        );
+        // thinking 关闭时推理被丢弃，既不作为 thinking 也不降级为 text。
+        assert_eq!(collect_text_content(&all_events), "");
         assert_eq!(collect_thinking_content(&all_events), "");
+        // 整个事件流里不得出现推理原文，否则客户端回放会把它带回历史正文。
+        let serialized = all_events
+            .iter()
+            .map(|e| e.data.to_string())
+            .collect::<String>();
+        assert!(
+            !serialized.contains("visible reasoning fallback"),
+            "推理原文泄漏进事件流: {serialized}"
+        );
         assert!(!all_events.iter().any(|e| {
             e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
         }));

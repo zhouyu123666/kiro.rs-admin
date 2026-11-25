@@ -409,7 +409,7 @@ fn resolve_usage_input_tokens(
     token::finalize_public_input_tokens(
         fallback_total_input_tokens,
         context_usage_percentage,
-        super::converter::get_context_window_size(model),
+        model,
         output_tokens,
     )
 }
@@ -453,6 +453,8 @@ pub(crate) fn available_models() -> Vec<Model> {
         model("claude-sonnet-4.5", "Claude Sonnet 4.5", "anthropic", 64000),
         model("claude-sonnet-4", "Claude Sonnet 4", "anthropic", 64000),
         model("claude-haiku-4.5", "Claude Haiku 4.5", "anthropic", 64000),
+        model("grok-4.7", "Grok 4.7", "xai", 64000),
+        model("kimi-k3", "Kimi K3", "moonshot", 64000),
         model("deepseek-3.2", "DeepSeek v3.2", "deepseek", 64000),
         model("minimax-m2.5", "MiniMax M2.5", "minimax", 64000),
         model("minimax-m2.1", "MiniMax M2.1", "minimax", 64000),
@@ -1669,12 +1671,10 @@ fn build_non_stream_content(
             "type": "text",
             "text": text_content
         }));
-    } else if has_native_thinking {
-        content.push(json!({
-            "type": "text",
-            "text": native_thinking
-        }));
     }
+    // 原生 reasoning 绝不能被重新标记为普通 text。thinking 关闭且没有可见输出
+    // 时保留空 content（工具块由调用方追加）：否则客户端下一轮回传的 text 会
+    // 把推理原文带进历史正文，绕过本次修复并再次触发上游拒答。
     content
 }
 
@@ -2314,7 +2314,7 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_native_thinking_downgrades_to_text_when_thinking_disabled() {
+    fn non_stream_native_thinking_is_not_text_when_thinking_disabled() {
         let content = build_non_stream_content(
             false,
             String::new(),
@@ -2323,9 +2323,45 @@ mod tests {
             vec!["ignored-redacted".to_string()],
         );
 
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "native thinking fallback");
+        // 只有推理、没有可见正文时保留空 content，不用推理兜底。
+        assert!(content.is_empty());
+        // 客户端回放这些 content block 时，无法把被抑制的推理重新当作 text 带回。
+        assert!(
+            !serde_json::to_string(&content)
+                .unwrap()
+                .contains("native thinking")
+        );
+    }
+
+    #[test]
+    fn non_stream_disabled_thinking_keeps_only_visible_answer() {
+        let content = build_non_stream_content(
+            false,
+            "answer".into(),
+            "private reasoning".into(),
+            Some("private-signature".into()),
+            vec!["private-redacted".into()],
+        );
+        assert_eq!(content, vec![json!({"type": "text", "text": "answer"})]);
+    }
+
+    #[test]
+    fn non_stream_thinking_only_preserves_type_and_signature_when_enabled() {
+        let content = build_non_stream_content(
+            true,
+            String::new(),
+            "native reasoning".into(),
+            Some("real-signature".into()),
+            Vec::new(),
+        );
+        assert_eq!(
+            content,
+            vec![json!({
+                "type": "thinking",
+                "thinking": "native reasoning",
+                "signature": "real-signature"
+            })]
+        );
     }
 
     #[test]
@@ -2398,6 +2434,8 @@ mod tests {
         assert!(ids.contains(&"minimax-m2.1"));
         assert!(ids.contains(&"glm-5"));
         assert!(ids.contains(&"qwen3-coder-next"));
+        assert!(ids.contains(&"grok-4.7"));
+        assert!(ids.contains(&"kimi-k3"));
         assert!(ids.contains(&"claude-sonnet-4.6"));
         assert!(ids.contains(&"claude-opus-4.8"));
     }

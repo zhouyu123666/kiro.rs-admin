@@ -326,6 +326,28 @@ impl HistoryAssistantMessage {
     }
 }
 
+/// Kiro/Q 线上协议中 assistant 历史的原生 reasoning union。
+///
+/// 单值字段：一条 assistant 历史消息最多携带一个 reasoning 块。协议结构对齐
+/// AWS 官方 `amazon-q-developer-cli` 的 `ReasoningContent` / `ReasoningText`
+/// 类型。序列化形如 `{"reasoningText":{"text":"...","signature":"..."}}` 或
+/// `{"redactedContent":"<base64>"}`。
+///
+/// 这个字段的存在意味着**推理内容绝不应拼进 `content` 正文**：上游分类器会把
+/// 正文里的推理原文判为 `REASONING_EXTRACTION` 并整轮拒答。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum KiroReasoningContent {
+    /// 明文思考 + 签名
+    ReasoningText {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// 加密思考（base64 不透明载荷）
+    RedactedContent(String),
+}
+
 /// 助手消息（历史记录中使用）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -335,6 +357,9 @@ pub struct AssistantMessage {
     /// 工具使用列表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_uses: Option<Vec<ToolUseEntry>>,
+    /// 原生推理内容。严禁把 thinking 拼入 `content` 正文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<KiroReasoningContent>,
 }
 
 impl AssistantMessage {
@@ -343,6 +368,7 @@ impl AssistantMessage {
         Self {
             content: content.into(),
             tool_uses: None,
+            reasoning_content: None,
         }
     }
 

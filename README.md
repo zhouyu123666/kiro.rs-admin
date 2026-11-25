@@ -48,7 +48,7 @@
 - 支持更多 JSON 凭据导入格式，已兼容 Kiro Account Manager `1.1.2` / `1.8.3`、Kiro-Go、CLiProxyAPIPlus 等导出格式；导入时会自动归一化 `external_idp` 字段、从 JWT 补全邮箱 / scopes / issuer / token endpoint 等信息。
 - 批量导入与 Account Manager 导入入口合并，支持导入时统一配置代理和 RPM；导出支持 Account Manager 嵌套格式与通用 JSON 格式。
 - 优化限流时的账号选择。普通 429 默认先在同一凭据上切换 `q` / `runtime` 独立限流端点，仍失败再自动切换凭据，避免账号池充足时仍对同一账号连续重试；同时合并 [GreyGunG/Kiro-RS-Tool](https://github.com/GreyGunG/Kiro-RS-Tool) 的策略设计，可在网页选择 `failover` / `turbo` / `fast` / `balanced` / `steady` / `polite` / `custom` 等 429 重试策略。
-- 支持动态模型兼容。原始 rs 主要面向 Claude 系列模型，现在会从 Kiro 拉取账号可用模型列表，并对 `auto`、DeepSeek、MiniMax、GLM、Qwen 等 Kiro 原生模型族做透传兼容，后续同族新模型通常不需要改代码。
+- 支持动态模型兼容。原始 rs 主要面向 Claude 系列模型，现在会从 Kiro 拉取账号可用模型列表，并对 `auto`、DeepSeek、MiniMax、GLM、Qwen、Grok、Kimi 等 Kiro 原生模型族做透传兼容，后续同族新模型通常不需要改代码。
 - 增强代理设置。全局和单个凭据都可以配置多个代理，提供粘性会话 / 轮询 / 最小负载三种代理负载策略；代理失效时支持自动切换、自动停用和直连兜底。
 - 优化并发与故障转移。普通 429 会利用 `q` / `runtime` 两套独立限流桶提高吞吐；凭据级风控冷却状态会在管理页展示。
 - 新增凭据测试响应功能，默认用 `claude-sonnet-4-6` 发送 `hello`，也可以先拉取模型列表后按模型单选或多选批量测试，并展示可读的响应片段和耗时。
@@ -494,6 +494,8 @@ Admin UI 的批量导入和 Account Manager 导入已经合并为同一个入口
 - `minimax-m2.5` / `minimax-m2.1`
 - `glm-5`
 - `qwen3-coder-next`
+- `grok-4.7`
+- `kimi-k3`
 
 模型映射策略：
 
@@ -504,6 +506,8 @@ Admin UI 的批量导入和 Account Manager 导入已经合并为同一个入口
 | `minimax-*`                                           | 原样透传                                       |
 | `glm-*`                                               | 原样透传                                       |
 | `qwen*`                                               | 原样透传                                       |
+| `grok-*`                                              | 原样透传                                       |
+| `kimi-*`                                              | 原样透传                                       |
 | `claude-<family>-<major>-<minor>`                     | 自动归一化为 `claude-<family>-<major>.<minor>` |
 | `fable`（任意）                                       | `claude-fable-5`                               |
 | `sonnet` + `5`（`sonnet-5` / `sonnet5` / `sonnet.5`） | `claude-sonnet-5`                              |
@@ -524,6 +528,9 @@ Admin UI 的批量导入和 Account Manager 导入已经合并为同一个入口
 - `deepseek-*`：`164_000`
 - `minimax-*`：`196_000`
 - `qwen*`：`256_000`
+- `grok-*`：`500_000`
+- `kimi-*`：`1_000_000`
+- `glm-*`：`200_000`
 - 其它 Claude / 未知模型：默认按 `200_000` 估算
 
 <a id="thinking-tools-websearch"></a>

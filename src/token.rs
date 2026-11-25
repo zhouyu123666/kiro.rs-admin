@@ -5,7 +5,10 @@
 //! 优先使用配置的 `count_tokens` API，失败时用 `cl100k_base` 本地估算。
 //! 按 Kiro-Go 的公开 usage 口径扣除 Kiro 后端固定系统上下文，但不再
 //! 乘旧的 1.843 系数，以保持各输入档位与当前测试基准的线性一致。
+//! 固定系统上下文按模型标定（`converter::get_context_overhead_tokens`）；
+//! 模型未标定、或扣减结果低于下限时，同样回退到请求内容计数。
 
+use crate::anthropic::converter::{get_context_overhead_tokens, get_context_window_size};
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
 };
@@ -14,10 +17,8 @@ use crate::model::config::TlsBackend;
 use std::sync::OnceLock;
 
 const CLAUDE_TOKEN_CORRECTION_FACTOR: f64 = 1.10;
-// 沿用 Kiro-Go 的公开 usage 校准结构：context occupancy 包含一段
-// 不应计入客户端 input usage 的后端系统提示。常量基于 2026-07-20
-// tokencheap.io 与两组 aitokentest 凭证的最新 R8 结果标定。
-const KIRO_DEFAULT_SYSTEM_PROMPT_TOKENS: i32 = 6_504;
+// contextUsage 扣减结果的可信下限（单条最短消息的 usage envelope）。
+// 低于它说明扣减已触底，改用请求内容计数。
 const CLAUDE_PUBLIC_CONTEXT_USAGE_MIN_TOKENS: i32 = 8;
 const APPROX_IMAGE_INPUT_TOKENS: u64 = 100;
 const APPROX_DOCUMENT_INPUT_TOKENS: u64 = 3_000;
@@ -342,30 +343,47 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
 
 /// 生成客户端可见的 public total input。
 ///
-/// Kiro 百分比是首要依据：先换算已占用上下文，再扣掉同轮输出。
-/// 按 Kiro-Go 的公开 Claude usage 逻辑，还需扣除 Kiro 后端自有的固定
-/// system prompt 开销；小请求保留公开 usage envelope 下限。请求计数
-/// 只在百分比不可用时回退。
+/// Kiro 百分比是首要依据：先换算已占用上下文，再扣掉同轮输出和该模型的
+/// 后端固定开销（Kiro 自有 system prompt 等，不属于客户端输入）。
+/// 以下情况回退请求内容计数：百分比不可用、模型未标定固定开销、
+/// 或扣减结果低于下限（标定值过期、输出估算偏大时会触底）。
 pub(crate) fn finalize_public_input_tokens(
     estimated_input_tokens: i32,
     context_usage_percentage: Option<f64>,
+    model: &str,
+    output_tokens: i32,
+) -> i32 {
+    context_usage_input_tokens(
+        estimated_input_tokens,
+        context_usage_percentage,
+        get_context_window_size(model),
+        get_context_overhead_tokens(model),
+        output_tokens,
+    )
+}
+
+fn context_usage_input_tokens(
+    estimated_input_tokens: i32,
+    context_usage_percentage: Option<f64>,
     context_window: i32,
+    backend_overhead_tokens: Option<i32>,
     output_tokens: i32,
 ) -> i32 {
     let fallback = estimated_input_tokens.max(0);
-    let Some(percentage) =
-        context_usage_percentage.filter(|value| value.is_finite() && *value > 0.0)
-    else {
+    let (Some(percentage), Some(overhead)) = (
+        context_usage_percentage.filter(|value| value.is_finite() && *value > 0.0),
+        backend_overhead_tokens,
+    ) else {
         return fallback;
     };
 
     let window = context_window.max(0);
     let occupied = ((window as f64) * percentage / 100.0).round() as i32;
-    let context_input = (occupied - output_tokens.max(0)).max(0);
-    let client_visible = context_input - KIRO_DEFAULT_SYSTEM_PROMPT_TOKENS;
-    client_visible
-        .max(CLAUDE_PUBLIC_CONTEXT_USAGE_MIN_TOKENS)
-        .clamp(0, window)
+    let client_visible = occupied - output_tokens.max(0) - overhead.max(0);
+    if client_visible < CLAUDE_PUBLIC_CONTEXT_USAGE_MIN_TOKENS {
+        return fallback;
+    }
+    client_visible.min(window)
 }
 
 #[cfg(test)]
@@ -403,8 +421,10 @@ mod tests {
         assert!(count_tokens(&"word ".repeat(800)) >= count_tokens(&"word ".repeat(799)));
     }
 
+    /// 2026-07 tokencheap R8 样本（1M 窗口，当时后端固定开销约 6480）：
+    /// 校验「已占用 - 固定开销」在各输入档位上与基准线性一致。
     #[test]
-    fn public_input_tokens_match_latest_tokencheap_r8_baseline() {
+    fn context_usage_conversion_is_linear_against_r8_samples() {
         let baseline = [32, 1_023, 9_945, 99_177, 495_762];
         let context_inputs = [
             [6_516, 7_548, 16_432, 105_618, 502_202],
@@ -414,7 +434,8 @@ mod tests {
         for samples in context_inputs {
             for (context_input, expected) in samples.into_iter().zip(baseline) {
                 let percentage = context_input as f64 / 10_000.0;
-                let actual = finalize_public_input_tokens(1, Some(percentage), 1_000_000, 0);
+                let actual =
+                    context_usage_input_tokens(1, Some(percentage), 1_000_000, Some(6_480), 0);
                 let tolerance = (expected as f64 * 0.10).max(5.0);
                 assert!(
                     (actual - expected).abs() as f64 <= tolerance,
@@ -426,15 +447,113 @@ mod tests {
 
     #[test]
     fn public_input_tokens_fall_back_when_kiro_percentage_is_unavailable() {
-        assert_eq!(finalize_public_input_tokens(123, None, 1_000_000, 1), 123);
+        for percentage in [None, Some(0.0), Some(f64::NAN)] {
+            assert_eq!(
+                context_usage_input_tokens(123, percentage, 1_000_000, Some(2_172), 1),
+                123
+            );
+        }
+    }
+
+    #[test]
+    fn public_input_tokens_fall_back_when_model_overhead_is_uncalibrated() {
         assert_eq!(
-            finalize_public_input_tokens(123, Some(0.0), 1_000_000, 1),
+            context_usage_input_tokens(123, Some(1.5), 1_000_000, None, 1),
             123
         );
         assert_eq!(
-            finalize_public_input_tokens(123, Some(f64::NAN), 1_000_000, 1),
+            finalize_public_input_tokens(123, Some(1.5), "some-unknown-model", 1),
             123
         );
+    }
+
+    /// 回归：扣减触底时曾被钳到固定的 8。现在回退请求内容计数。
+    #[test]
+    fn public_input_tokens_fall_back_when_deduction_bottoms_out() {
+        // 已占用 2188，小于固定开销 6504
+        assert_eq!(
+            context_usage_input_tokens(16, Some(0.2188), 1_000_000, Some(6_504), 1),
+            16
+        );
+        // 输出估算偏大，把扣减结果压到下限以下
+        assert_eq!(
+            context_usage_input_tokens(27, Some(2.5625), 200_000, Some(4_300), 1_202),
+            27
+        );
+        // 刚好等于下限时仍采用换算值
+        assert_eq!(
+            context_usage_input_tokens(500, Some(0.2180), 1_000_000, Some(2_172), 0),
+            8
+        );
+    }
+
+    /// 2026-11-25 真实上游样本（ide 端点）的 contextUsagePercentage，输出均为 1 token。
+    /// tiny = "Reply with the single word: ok"，单条 user 消息，约 14 token。
+    /// mid = tiny 前加 160 句英文填充；各家分词结果不同（约 2.56k ~ 4.0k），
+    /// 本地估算为 2832。
+    ///
+    /// gpt-5.6-terra、grok-4.7、kimi-k3、minimax-m2.1 的 tiny 样本取 12 次重复中的
+    /// 最小值，这几个模型同一请求体的占用量会向上浮动。
+    /// 未收录：claude-fable-5.2 的 tiny 样本（8 次为 0.2240% ~ 0.2332%，
+    /// 比同组多 53 ~ 145 token），不适合做定值断言。
+    #[test]
+    fn public_input_tokens_track_prompt_size_on_upstream_samples() {
+        let tiny = [
+            ("claude-sonnet-4-5-20250929", 2.1575000286102295),
+            ("claude-haiku-4.5", 2.1575000286102295),
+            ("claude-opus-4-5-20251101", 2.1575000286102295),
+            ("claude-sonnet-4.6", 0.4315999746322632),
+            ("claude-opus-4.6", 0.4377000033855438),
+            ("claude-opus-4.7", 0.6263999938964844),
+            ("claude-opus-4.8", 0.21860000491142273),
+            ("claude-opus-5.5", 0.21879999339580536),
+            ("claude-sonnet-5", 0.21860000491142273),
+            ("claude-sonnet-5-5", 0.21879999339580536),
+            ("claude-haiku-5-5", 0.21879999339580536),
+            ("claude-fable-5.1", 0.21879999339580536),
+            ("auto", 0.21879999339580536),
+            ("gpt-5.6-sol", 0.1395537555217743),
+            ("gpt-5.6-luna", 0.1395537555217743),
+            ("gpt-5.6-terra", 0.1414807289838791),
+            ("grok-4.7", 0.2858000099658966),
+            ("kimi-k3", 0.15129999816417694),
+            ("glm-5", 1.945500135421753),
+            ("deepseek-3.2", 2.404268264770508),
+            ("minimax-m2.5", 1.974489688873291),
+            ("minimax-m2.1", 1.9750001430511477),
+            ("qwen3-coder-next", 1.5265624523162842),
+        ];
+        for (model, percentage) in tiny {
+            let actual = finalize_public_input_tokens(1, Some(percentage), model, 1);
+            assert!(
+                (9..=19).contains(&actual),
+                "tiny: model={model} percentage={percentage} actual={actual}"
+            );
+        }
+
+        let mid = [
+            ("claude-sonnet-4-5-20250929", 3.5179998874664307),
+            ("claude-haiku-4.5", 3.5179998874664307),
+            ("claude-opus-4-5-20251101", 3.5179998874664307),
+            ("claude-sonnet-4.6", 0.7037000060081482),
+            ("claude-opus-4.7", 1.0264999866485596),
+            ("claude-opus-5.5", 0.6189000010490417),
+            ("claude-sonnet-5", 0.6186999678611755),
+            ("claude-sonnet-5-5", 0.6189000010490417),
+            ("claude-haiku-5-5", 0.6189000010490417),
+            ("claude-fable-5.2", 0.6189000010490417),
+            ("gpt-5.6-luna", 0.4016227126121521),
+            ("grok-4.7", 0.7996000051498413),
+            ("kimi-k3", 0.4108999967575073),
+            ("glm-5", 3.225500106811523),
+        ];
+        for (model, percentage) in mid {
+            let actual = finalize_public_input_tokens(1, Some(percentage), model, 1);
+            assert!(
+                (2_500..=4_100).contains(&actual),
+                "mid: model={model} percentage={percentage} actual={actual}"
+            );
+        }
     }
 
     #[test]
