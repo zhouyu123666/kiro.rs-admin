@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### ✨ 新功能 — 月度额度重置后自动恢复 QuotaExceeded 凭据（默认关闭）
+
+- 参考 ZyphrZero/kiro.rs PR #107。新增 `quotaResetRecoveryEnabled` 配置（默认 `false`，不改变现有行为）；开启后，后台余额刷新任务会复查因额度用尽而禁用的凭据，省去每个计费周期初逐个手动启用。
+- 按凭据自己缓存的 `nextResetAt` 到期才复查，没有缓存重置时间的凭据直接复查一次；确认 `remaining > 0` 才恢复，超额开关不作为依据。
+- `recover_quota_exceeded` 只做 `QuotaExceeded` → 可用的转换，手动禁用、Token 失效、配置无效等其它原因禁用的凭据一律不动；恢复时清零失败计数和冷却。
+- `QuotaExceeded` 禁用原因随凭据文件落盘（`disabledReason` 字段），余额缓存加载时不再丢弃过期条目，服务重启后仍能在重置时间到达时恢复。
+- Admin API：`GET` / `PUT /api/admin/config/quota-reset-recovery`，运行时修改持久化到 `config.json`，写盘失败回滚内存状态。Admin UI：设置菜单 →「月度额度恢复」开关。
+
 ### 🔧 修复 — Codex Remote Compaction v2
 
 - 识别 Responses input 末尾唯一的 `compaction_trigger`，让手动 `/compact` 与上下文阈值触发的自动压缩进入专用 Kiro 摘要路径，不再返回普通 `reasoning` / `message` 项并触发 `expected exactly one compaction output item`。

@@ -19,6 +19,7 @@ import {
 import {
   useLoadBalancingMode, useSetLoadBalancingMode,
   useAccountThrottleConfig, useSetAccountThrottleConfig,
+  useQuotaResetRecoveryConfig, useSetQuotaResetRecoveryConfig,
   useRetryPolicy, useSetRetryPolicy,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
@@ -320,6 +321,7 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         </DropdownMenuItem>
         <RetryCompactItems controls={controls} />
         <ThrottleCompactItems {...throttleProps} />
+        <QuotaResetRecoveryItems />
         <DropdownMenuLabel>模型</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openModelMappings}>
           <Shuffle />模型映射（请求时模型名转发）
@@ -664,7 +666,8 @@ function KeySettingsMenu({
           <Settings className="h-4 w-4" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
+      <DropdownMenuContent align="end" className="w-72">
+        <QuotaResetRecoveryItems />
         <DropdownMenuLabel>模型</DropdownMenuLabel>
         <DropdownMenuItem onSelect={onOpenModelMappings}>
           <Shuffle />模型映射（请求时模型名转发）
@@ -675,6 +678,50 @@ function KeySettingsMenu({
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
+  )
+}
+
+/**
+ * 「月度额度恢复」开关（默认关闭）。
+ *
+ * 开启后，后台余额刷新任务会在 QuotaExceeded 凭据到达重置时间后复查余额，
+ * 确认额度恢复才重新启用。放在下拉菜单内，菜单打开时才请求配置。
+ */
+function QuotaResetRecoveryItems() {
+  const { data, isLoading } = useQuotaResetRecoveryConfig()
+  const { mutate, isPending } = useSetQuotaResetRecoveryConfig()
+  const enabled = data?.enabled ?? false
+
+  const handleToggle = (next: boolean) => {
+    mutate({ enabled: next }, {
+      onSuccess: () => toast.success(next ? '已开启月度额度自动恢复' : '已关闭月度额度自动恢复'),
+      onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  return (
+    <>
+      <DropdownMenuLabel>月度额度恢复</DropdownMenuLabel>
+      <div className="px-2 pb-2">
+        <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
+          <div className="text-xs">
+            <div className="font-medium text-foreground">
+              {isLoading ? '加载中…' : enabled ? '开启' : '关闭'}
+            </div>
+            <div className="text-muted-foreground leading-snug">
+              {enabled
+                ? '因额度用尽被禁用的凭据，到达重置时间且确认余额恢复后自动启用'
+                : '因额度用尽被禁用的凭据，额度重置后仍需手动启用'}
+            </div>
+          </div>
+          <Switch
+            checked={enabled}
+            disabled={isLoading || isPending}
+            onCheckedChange={handleToggle}
+          />
+        </div>
+      </div>
+    </>
   )
 }
 

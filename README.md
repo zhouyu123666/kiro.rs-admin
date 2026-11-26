@@ -309,6 +309,7 @@ Admin API 鉴权同样支持：
 | `proxyBalancingMode`              |      `sticky` | 多代理候选选择策略：`sticky`、`round_robin` 或 `least_load`                                |
 | `accountThrottleFailover`         |        `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据                                        |
 | `accountThrottleCooldownSecs`     |        `1800` | 账号级风控冷却秒数                                                                         |
+| `quotaResetRecoveryEnabled`       |       `false` | 月度额度重置后，是否自动恢复因额度用尽（`QuotaExceeded`）而禁用的凭据                      |
 | `retryMode`                       |    `failover` | 普通 429 重试策略：`failover`、`turbo`、`fast`、`balanced`、`steady`、`polite` 或 `custom` |
 | `retryPolicy`                     |            无 | `retryMode=custom` 时使用的普通 429 自定义策略                                             |
 | `toolCompatibilityMode`           | `claude-code` | `claude-code` 启用内置工具双向映射；`raw` 保留旧的 schema 透传行为                         |
@@ -808,6 +809,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 
 - 单凭据连续 API 失败会增加失败计数，达到阈值后跳过。
 - 402 / quota exhausted 会禁用该凭据并切换。
+- 开启 `quotaResetRecoveryEnabled`（默认关闭，可在 Admin 设置菜单的「月度额度恢复」切换）后，后台余额刷新任务会在这类凭据到达自身的重置时间后复查一次余额，确认订阅额度恢复为正数才重新启用；手动禁用、Token 失效等其它原因禁用的凭据不受影响。
 - 401 / 403 中识别到 bearer token 失效时，会对该凭据强制刷新一次 token 后重试。
 - 普通 429 可按策略切换端点、切换凭据、短冷却或尊重 `Retry-After`。
 - 429 + suspicious activity 可触发账号级冷却并切换凭据。

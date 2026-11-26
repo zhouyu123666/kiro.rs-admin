@@ -136,6 +136,14 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub disabled: bool,
 
+    /// 禁用原因（仅在需要跨重启保留时写入，目前只有 `QuotaExceeded`）。
+    ///
+    /// 「月度额度自动恢复」只处理因额度耗尽而禁用的凭据，重启后必须还能把它们
+    /// 和手动禁用区分开。字段缺失时按手动禁用处理。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -213,6 +221,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("proxy_username", &self.proxy_username)
             .field("proxy_password", &fmt_redacted(&self.proxy_password))
             .field("disabled", &self.disabled)
+            .field("disabled_reason", &self.disabled_reason)
             .field("kiro_api_key", &fmt_redacted(&self.kiro_api_key))
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
@@ -948,6 +957,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -1188,6 +1198,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -1227,6 +1238,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],
@@ -1349,6 +1361,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             endpoint: None,
             groups: vec![],

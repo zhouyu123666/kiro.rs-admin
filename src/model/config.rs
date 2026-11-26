@@ -298,6 +298,13 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 月度额度重置后是否自动恢复因额度耗尽（`QuotaExceeded`）而禁用的凭据（默认 false）。
+    ///
+    /// 开启后：后台余额刷新任务会在凭据自身的 `nextResetAt` 到期后复查一次余额，
+    /// 确认订阅额度恢复为正数才重新启用；手动禁用、Token 失效等其它原因禁用的凭据不受影响。
+    #[serde(default)]
+    pub quota_reset_recovery_enabled: bool,
+
     /// 普通 429 重试策略模式。默认 `failover` 保持当前项目行为。
     #[serde(default = "default_retry_mode")]
     pub retry_mode: RetryMode,
@@ -461,6 +468,7 @@ impl Default for Config {
             proxy_balancing_mode: default_proxy_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            quota_reset_recovery_enabled: false,
             retry_mode: default_retry_mode(),
             retry_policy: None,
             extract_thinking: default_extract_thinking(),
@@ -533,5 +541,22 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quota_reset_recovery_is_disabled_by_default() {
+        assert!(!Config::default().quota_reset_recovery_enabled);
+
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.quota_reset_recovery_enabled);
+
+        let config: Config =
+            serde_json::from_str(r#"{"quotaResetRecoveryEnabled": true}"#).unwrap();
+        assert!(config.quota_reset_recovery_enabled);
     }
 }

@@ -586,6 +586,22 @@ pub struct SetAccountThrottleConfigRequest {
     pub cooldown_secs: Option<u64>,
 }
 
+/// 月度额度重置后自动恢复配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaResetRecoveryConfigResponse {
+    /// 到 nextResetAt 后确认余额恢复时，是否自动恢复 QuotaExceeded 凭据
+    pub enabled: bool,
+}
+
+/// 更新月度额度重置后自动恢复配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetQuotaResetRecoveryConfigRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
 /// 普通 429 重试策略响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

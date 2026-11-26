@@ -942,6 +942,30 @@ enum DisabledReason {
     InvalidConfig,
 }
 
+/// 写入凭据文件的 `QuotaExceeded` 禁用原因标识。
+const PERSISTED_QUOTA_EXCEEDED: &str = "QuotaExceeded";
+
+impl DisabledReason {
+    /// 需要跨重启保留的禁用原因。
+    ///
+    /// 只持久化 `QuotaExceeded`：月度额度自动恢复必须在重启后仍能把它和手动禁用
+    /// 区分开。其它原因保持原有行为，重启后一律按手动禁用处理。
+    fn persisted(self) -> Option<&'static str> {
+        match self {
+            Self::QuotaExceeded => Some(PERSISTED_QUOTA_EXCEEDED),
+            _ => None,
+        }
+    }
+
+    /// 从凭据文件恢复已禁用凭据的禁用原因，缺失或无法识别时按手动禁用处理。
+    fn from_persisted(value: Option<&str>) -> Self {
+        match value {
+            Some(PERSISTED_QUOTA_EXCEEDED) => Self::QuotaExceeded,
+            _ => Self::Manual,
+        }
+    }
+}
+
 /// 统计数据持久化条目
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
@@ -1066,6 +1090,8 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 月度额度重置后自动恢复 QuotaExceeded 凭据（运行时可修改）
+    quota_reset_recovery_enabled: AtomicBool,
     /// 普通 429 重试策略模式（运行时可修改）
     retry_mode: Mutex<RetryMode>,
     /// 普通 429 自定义策略（运行时可修改）
@@ -1224,6 +1250,9 @@ impl MultiTokenManager {
                         Some(machine_id::generate_from_credentials(&cred, config_ref));
                     has_new_machine_ids = true;
                 }
+                // 禁用原因以 CredentialEntry 为准，内存中的凭据对象不保留副本，
+                // 写盘时由 `persist_credentials` 重新填入。
+                let persisted_reason = cred.disabled_reason.take();
                 CredentialEntry {
                     id,
                     credentials: cred.clone(),
@@ -1232,7 +1261,7 @@ impl MultiTokenManager {
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
                     disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
+                        Some(DisabledReason::from_persisted(persisted_reason.as_deref()))
                     } else {
                         None
                     },
@@ -1290,6 +1319,7 @@ impl MultiTokenManager {
         let proxy_balancing_mode = config.proxy_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let quota_reset_recovery_enabled = config.quota_reset_recovery_enabled;
         let retry_mode = config.retry_mode;
         let retry_policy = config.retry_policy.clone();
         let manager = Self {
@@ -1306,6 +1336,7 @@ impl MultiTokenManager {
             proxy_balancing_mode: Mutex::new(proxy_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            quota_reset_recovery_enabled: AtomicBool::new(quota_reset_recovery_enabled),
             retry_mode: Mutex::new(retry_mode),
             retry_policy: Mutex::new(retry_policy),
             last_stats_save_at: Mutex::new(None),
@@ -1865,6 +1896,11 @@ impl MultiTokenManager {
                     cred.canonicalize_auth_method();
                     // 同步 disabled 状态到凭据对象
                     cred.disabled = e.disabled;
+                    cred.disabled_reason = e
+                        .disabled_reason
+                        .filter(|_| e.disabled)
+                        .and_then(DisabledReason::persisted)
+                        .map(str::to_string);
                     cred
                 })
                 .collect()
@@ -2702,6 +2738,36 @@ impl MultiTokenManager {
         }
         self.persist_credentials()?;
         Ok(())
+    }
+
+    /// 在上游计费周期重置后恢复此前因额度耗尽而禁用的凭据。
+    ///
+    /// 这是一个严格的状态转换：只允许 `QuotaExceeded` → 可用，绝不影响手动禁用、
+    /// Token 失效等其它禁用原因。调用方必须已从上游余额接口确认该凭据恢复了可用额度。
+    ///
+    /// 返回 `Ok(true)` 表示已恢复；`Ok(false)` 表示凭据当前不是 `QuotaExceeded`
+    /// 禁用状态（例如探测期间被管理员手动处理过），未做任何修改。
+    pub fn recover_quota_exceeded(&self, id: u64) -> anyhow::Result<bool> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if !entry.disabled || entry.disabled_reason != Some(DisabledReason::QuotaExceeded) {
+                return Ok(false);
+            }
+            entry.disabled = false;
+            entry.disabled_reason = None;
+            entry.failure_count = 0;
+            entry.refresh_failure_count = 0;
+            entry.throttled_until = None;
+            entry.rate_limited_until = None;
+        }
+        // 持久化更改
+        self.persist_credentials()?;
+        tracing::info!("凭据 #{} 额度已恢复，重新加入调度", id);
+        Ok(true)
     }
 
     /// 设置凭据优先级（Admin API）
@@ -3989,6 +4055,52 @@ impl MultiTokenManager {
         config
             .save()
             .with_context(|| format!("持久化账号级风控配置失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// 是否允许在上游月度额度重置后自动恢复 QuotaExceeded 凭据（Admin API）
+    pub fn quota_reset_recovery_enabled(&self) -> bool {
+        self.quota_reset_recovery_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 更新月度额度自动恢复开关，并持久化到 config.json（Admin API）
+    pub fn set_quota_reset_recovery_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        let previous = self
+            .quota_reset_recovery_enabled
+            .swap(enabled, Ordering::Relaxed);
+        if previous == enabled {
+            return Ok(());
+        }
+
+        if let Err(err) = self.persist_quota_reset_recovery_enabled(enabled) {
+            // 回滚内存值
+            self.quota_reset_recovery_enabled
+                .store(previous, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!("月度额度自动恢复配置已更新: enabled={}", enabled);
+        Ok(())
+    }
+
+    fn persist_quota_reset_recovery_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，月度额度自动恢复配置仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.quota_reset_recovery_enabled = enabled;
+        config
+            .save()
+            .with_context(|| format!("持久化月度额度自动恢复配置失败: {}", config_path.display()))?;
 
         Ok(())
     }
@@ -5440,6 +5552,134 @@ mod tests {
         // 原子落盘后不应残留临时文件
         let tmp = path.with_extension("json.tmp");
         assert!(!tmp.exists(), "原子落盘后不应残留临时文件");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quota_exceeded_recovers_only_from_quota_disabled_state() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default(), KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let entry_of = |id: u64| {
+            manager
+                .snapshot()
+                .entries
+                .into_iter()
+                .find(|entry| entry.id == id)
+                .unwrap()
+        };
+
+        // 额度耗尽禁用的凭据可以恢复，并清零失败计数
+        manager.report_quota_exhausted(1);
+        assert_eq!(entry_of(1).disabled_reason.as_deref(), Some("QuotaExceeded"));
+        assert!(manager.recover_quota_exceeded(1).unwrap());
+        let first = entry_of(1);
+        assert!(!first.disabled);
+        assert_eq!(first.disabled_reason, None);
+        assert_eq!(first.failure_count, 0);
+
+        // 已经可用的凭据不做任何修改
+        assert!(!manager.recover_quota_exceeded(1).unwrap());
+
+        // 手动禁用的凭据不受影响
+        manager.set_disabled(2, true).unwrap();
+        assert!(!manager.recover_quota_exceeded(2).unwrap());
+        let second = entry_of(2);
+        assert!(second.disabled);
+        assert_eq!(second.disabled_reason.as_deref(), Some("Manual"));
+
+        assert!(manager.recover_quota_exceeded(99).is_err());
+    }
+
+    /// QuotaExceeded 禁用原因随凭据文件落盘，重启后仍能和手动禁用区分开；
+    /// 恢复或改为手动禁用后，文件里的原因随之清除。
+    #[test]
+    fn quota_exceeded_reason_survives_restart() {
+        let path = tmp_creds_path("quota_reason");
+        let cred = |id: u64| {
+            let mut cred = KiroCredentials::default();
+            cred.id = Some(id);
+            cred.refresh_token = Some(format!("tok_{id}").repeat(10));
+            cred
+        };
+        let load = || -> Vec<KiroCredentials> {
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+        };
+        let reason_of = |manager: &MultiTokenManager, id: u64| {
+            manager
+                .snapshot()
+                .entries
+                .into_iter()
+                .find(|entry| entry.id == id)
+                .unwrap()
+                .disabled_reason
+        };
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred(1), cred(2)],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+        manager.disable_quota_exceeded(1).unwrap();
+        manager.set_disabled(2, true).unwrap();
+
+        let saved = load();
+        assert_eq!(saved[0].disabled_reason.as_deref(), Some("QuotaExceeded"));
+        assert_eq!(saved[1].disabled_reason, None);
+
+        // 模拟重启
+        let manager =
+            MultiTokenManager::new(Config::default(), saved, None, Some(path.clone()), true)
+                .unwrap();
+        assert_eq!(reason_of(&manager, 1).as_deref(), Some("QuotaExceeded"));
+        assert_eq!(reason_of(&manager, 2).as_deref(), Some("Manual"));
+
+        assert!(manager.recover_quota_exceeded(1).unwrap());
+        assert!(!manager.recover_quota_exceeded(2).unwrap());
+        let saved = load();
+        assert!(!saved[0].disabled);
+        assert_eq!(saved[0].disabled_reason, None);
+        assert!(saved[1].disabled);
+
+        // 额度禁用后被管理员改为手动禁用：原因不再是 QuotaExceeded
+        manager.disable_quota_exceeded(1).unwrap();
+        manager.set_disabled(1, true).unwrap();
+        assert_eq!(load()[0].disabled_reason, None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quota_reset_recovery_toggle_persists_to_config_file() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro_rs_quota_recovery_{}_{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&path, r#"{"port": 18091}"#).unwrap();
+        let config = Config::load(&path).unwrap();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        assert!(!manager.quota_reset_recovery_enabled());
+        manager.set_quota_reset_recovery_enabled(true).unwrap();
+        assert!(manager.quota_reset_recovery_enabled());
+
+        let reloaded = Config::load(&path).unwrap();
+        assert!(reloaded.quota_reset_recovery_enabled);
+        // 其它配置项不受影响
+        assert_eq!(reloaded.port, 18091);
+
+        manager.set_quota_reset_recovery_enabled(false).unwrap();
+        assert!(!Config::load(&path).unwrap().quota_reset_recovery_enabled);
 
         let _ = std::fs::remove_file(&path);
     }

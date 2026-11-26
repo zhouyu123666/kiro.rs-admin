@@ -32,6 +32,7 @@
 .ace-tool/
 .codegraph/
 .claude/
+.workbuddy/
 test/
 # 第三方演示
 demo/

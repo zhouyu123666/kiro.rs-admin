@@ -25,7 +25,8 @@ use super::{
         CreateClientKeyResponse, CredentialResponseTestRequest, GlobalProxyResponse,
         ProxyCheckUrlRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
         SetGlobalProxyRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-        SetPriorityRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
+        SetPriorityRequest, SetProxyBalancingModeRequest, SetQuotaResetRecoveryConfigRequest,
+        SetRetryPolicyRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -606,6 +607,26 @@ pub async fn set_account_throttle_config(
     Json(payload): Json<SetAccountThrottleConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_account_throttle_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/quota-reset-recovery
+/// 获取月度额度重置后自动恢复配置
+pub async fn get_quota_reset_recovery_config(
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    Json(state.service.get_quota_reset_recovery_config())
+}
+
+/// PUT /api/admin/config/quota-reset-recovery
+/// 更新月度额度重置后自动恢复配置
+pub async fn set_quota_reset_recovery_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetQuotaResetRecoveryConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_quota_reset_recovery_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

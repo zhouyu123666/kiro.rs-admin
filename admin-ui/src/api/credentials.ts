@@ -534,6 +534,24 @@ export async function setAccountThrottleConfig(
   return data
 }
 
+export interface QuotaResetRecoveryConfig {
+  enabled: boolean
+}
+
+// 获取月度额度重置后自动恢复配置
+export async function getQuotaResetRecoveryConfig(): Promise<QuotaResetRecoveryConfig> {
+  const { data } = await api.get<QuotaResetRecoveryConfig>('/config/quota-reset-recovery')
+  return data
+}
+
+// 更新月度额度重置后自动恢复配置
+export async function setQuotaResetRecoveryConfig(
+  patch: QuotaResetRecoveryConfig,
+): Promise<QuotaResetRecoveryConfig> {
+  const { data } = await api.put<QuotaResetRecoveryConfig>('/config/quota-reset-recovery', patch)
+  return data
+}
+
 export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number

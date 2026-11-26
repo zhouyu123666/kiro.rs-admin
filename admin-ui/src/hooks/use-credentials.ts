@@ -16,6 +16,8 @@ import {
   setLoadBalancingMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
+  getQuotaResetRecoveryConfig,
+  setQuotaResetRecoveryConfig,
   getRetryPolicy,
   setRetryPolicy,
   getLogGovernanceConfig,
@@ -213,6 +215,25 @@ export function useSetAccountThrottleConfig() {
     mutationFn: setAccountThrottleConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+    },
+  })
+}
+
+// 获取月度额度重置后自动恢复配置
+export function useQuotaResetRecoveryConfig() {
+  return useQuery({
+    queryKey: ['quotaResetRecoveryConfig'],
+    queryFn: getQuotaResetRecoveryConfig,
+  })
+}
+
+// 更新月度额度重置后自动恢复配置
+export function useSetQuotaResetRecoveryConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setQuotaResetRecoveryConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['quotaResetRecoveryConfig'] })
     },
   })
 }

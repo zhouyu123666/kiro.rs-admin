@@ -34,8 +34,9 @@ use super::types::{
     ImageUpdateResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
     PollIdcLoginResponse, ProxyBalancingModeResponse, ProxyCheckAllResponse, ProxyCheckResponse,
     ProxyCheckUrlRequest, ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult,
-    RetryPolicyResponse, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest, SetRetryPolicyRequest,
+    QuotaResetRecoveryConfigResponse, RetryPolicyResponse, SetAccountThrottleConfigRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetProxyBalancingModeRequest,
+    SetQuotaResetRecoveryConfigRequest, SetRetryPolicyRequest,
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
     UpdateRefreshTokenRequest,
@@ -952,17 +953,44 @@ impl AdminService {
     ///
     /// 串行执行以避免对上游产生瞬时高并发，每次成功的查询都会更新内存缓存
     /// 与磁盘缓存。失败的条目不会清空旧缓存，调用方可在下次轮询时重试。
+    ///
+    /// 开启「月度额度自动恢复」时，还会复查重置时间已到的 `QuotaExceeded` 凭据，
+    /// 确认订阅额度恢复后重新启用。其它原因禁用的凭据始终跳过。
     pub async fn refresh_all_balances(&self) -> (usize, usize) {
         let snapshot = self.token_manager.snapshot();
+        let now_ts = Utc::now().timestamp() as f64;
+        // 需要做恢复探测的 QuotaExceeded 凭据。按凭据自己缓存的 nextResetAt 判断，
+        // 不会因为一个账号到期就把所有禁用账号都查一遍。
+        let quota_recovery_probes: HashSet<u64> =
+            if self.token_manager.quota_reset_recovery_enabled() {
+                let cache = self.balance_cache.lock();
+                snapshot
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.disabled
+                            && entry.disabled_reason.as_deref() == Some("QuotaExceeded")
+                            && quota_recovery_probe_is_due(&cache, entry.id, now_ts)
+                    })
+                    .map(|entry| entry.id)
+                    .collect()
+            } else {
+                HashSet::new()
+            };
         let mut success = 0_usize;
         let mut failure = 0_usize;
 
         for entry in snapshot.entries.into_iter() {
-            if entry.disabled {
+            let quota_recovery_probe = quota_recovery_probes.contains(&entry.id);
+            if entry.disabled && !quota_recovery_probe {
                 continue;
             }
             match self.fetch_balance(entry.id).await {
                 Ok(balance) => {
+                    // 只认订阅额度在新计费周期恢复为正数。超额开关即使仍开着，
+                    // 也不能证明超额额度没用完。
+                    let remaining = balance.remaining;
+                    let quota_recovered = quota_recovery_probe && remaining > 0.0;
                     {
                         let mut cache = self.balance_cache.lock();
                         cache.insert(
@@ -972,6 +1000,24 @@ impl AdminService {
                                 data: balance,
                             },
                         );
+                    }
+                    if quota_recovered {
+                        match self.token_manager.recover_quota_exceeded(entry.id) {
+                            Ok(true) => tracing::info!(
+                                "上游计费周期已重置，凭据 #{} 剩余额度 {:.2}，已自动恢复可用",
+                                entry.id,
+                                remaining
+                            ),
+                            Ok(false) => tracing::debug!(
+                                "额度恢复探测期间凭据 #{} 状态已变化，跳过自动恢复",
+                                entry.id
+                            ),
+                            Err(e) => tracing::warn!(
+                                "凭据 #{} 余额已恢复，但自动恢复失败: {}",
+                                entry.id,
+                                e
+                            ),
+                        }
                     }
                     success += 1;
                 }
@@ -1263,6 +1309,7 @@ impl AdminService {
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
+            disabled_reason: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
             groups: req.groups,
@@ -2079,6 +2126,31 @@ impl AdminService {
         Ok(self.get_account_throttle_config())
     }
 
+    /// 获取月度额度重置后自动恢复配置
+    pub fn get_quota_reset_recovery_config(&self) -> QuotaResetRecoveryConfigResponse {
+        QuotaResetRecoveryConfigResponse {
+            enabled: self.token_manager.quota_reset_recovery_enabled(),
+        }
+    }
+
+    /// 更新月度额度重置后自动恢复配置
+    pub fn set_quota_reset_recovery_config(
+        &self,
+        req: SetQuotaResetRecoveryConfigRequest,
+    ) -> Result<QuotaResetRecoveryConfigResponse, AdminServiceError> {
+        let Some(enabled) = req.enabled else {
+            return Err(AdminServiceError::InvalidCredential(
+                "必须提供 enabled 字段".to_string(),
+            ));
+        };
+
+        self.token_manager
+            .set_quota_reset_recovery_enabled(enabled)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_quota_reset_recovery_config())
+    }
+
     /// 获取普通 429 重试策略
     pub fn get_retry_policy(&self) -> Result<RetryPolicyResponse, AdminServiceError> {
         let (mode, custom_policy, effective_policy) = self
@@ -2373,16 +2445,12 @@ impl AdminService {
             }
         };
 
-        let now = Utc::now().timestamp() as f64;
         map.into_iter()
             .filter_map(|(k, v)| {
                 let id = k.parse::<u64>().ok()?;
-                // 丢弃超过 TTL 的条目
-                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    Some((id, v))
-                } else {
-                    None
-                }
+                // 新鲜度由各读取方按 TTL 判断。这里保留过期条目，服务重启后才能
+                // 继续用 nextResetAt 判断 QuotaExceeded 凭据何时复查。
+                Some((id, v))
             })
             .collect()
     }
@@ -3591,6 +3659,25 @@ impl AdminService {
     }
 }
 
+/// 判断某个 QuotaExceeded 凭据现在是否该做一次额度恢复探测。
+///
+/// `nextResetAt` 是上游 Usage Limits 响应的 Unix 秒时间戳。凭据有缓存的重置时间时，
+/// 到期后才探测，避免对已禁用账号持续查询上游；没有缓存的重置时间时直接探测，
+/// 查询成功后缓存里就有了它自己的重置时间。
+fn quota_recovery_probe_is_due(
+    cache: &HashMap<u64, CachedBalance>,
+    credential_id: u64,
+    now_ts: f64,
+) -> bool {
+    match cache
+        .get(&credential_id)
+        .and_then(|cached| cached.data.next_reset_at)
+    {
+        Some(reset_at) => reset_at <= now_ts,
+        None => true,
+    }
+}
+
 fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
     error
         .downcast_ref::<UpstreamRateLimitError>()
@@ -3620,6 +3707,57 @@ fn unix_timestamp_to_utc_date(timestamp: f64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cached_balance(next_reset_at: Option<f64>) -> CachedBalance {
+        CachedBalance {
+            cached_at: 1.0,
+            data: BalanceResponse {
+                id: 1,
+                subscription_title: None,
+                subscription_type: None,
+                user_id: None,
+                current_usage: 100.0,
+                usage_limit: 100.0,
+                remaining: 0.0,
+                usage_percentage: 100.0,
+                next_reset_at,
+                overage_enabled: None,
+                overage_capable: None,
+                overage_capability_raw: None,
+            },
+        }
+    }
+
+    #[test]
+    fn quota_recovery_probe_waits_for_upstream_reset_time() {
+        let cache = HashMap::from([(1, cached_balance(Some(100.0)))]);
+
+        assert!(!quota_recovery_probe_is_due(&cache, 1, 99.0));
+        assert!(quota_recovery_probe_is_due(&cache, 1, 100.0));
+        assert!(quota_recovery_probe_is_due(&cache, 1, 101.0));
+    }
+
+    #[test]
+    fn quota_recovery_probe_uses_own_reset_time() {
+        let cache = HashMap::from([
+            (1, cached_balance(Some(200.0))),
+            (2, cached_balance(Some(100.0))),
+        ]);
+
+        // 凭据 2 到期不会带着凭据 1 一起探测
+        assert!(!quota_recovery_probe_is_due(&cache, 1, 150.0));
+        assert!(quota_recovery_probe_is_due(&cache, 2, 150.0));
+    }
+
+    #[test]
+    fn quota_recovery_probe_runs_when_reset_time_is_unknown() {
+        let cache = HashMap::from([(1, cached_balance(None))]);
+
+        // 缓存里没有重置时间
+        assert!(quota_recovery_probe_is_due(&cache, 1, 150.0));
+        // 完全没有缓存
+        assert!(quota_recovery_probe_is_due(&cache, 2, 150.0));
+    }
 
     #[test]
     fn typed_upstream_rate_limit_is_classified_without_losing_retry_after() {

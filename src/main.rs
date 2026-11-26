@@ -182,6 +182,9 @@ async fn main() {
     } else {
         tracing::info!("账号级风控转移: 关闭（suspicious activity 429 按普通瞬态错误退避重试，不冷却/不换号）");
     }
+    if config.quota_reset_recovery_enabled {
+        tracing::info!("月度额度自动恢复: 开启（QuotaExceeded 凭据到达重置时间且余额恢复后自动启用）");
+    }
 
     // 创建 MultiTokenManager 和 KiroProvider
     let token_manager = MultiTokenManager::new(
